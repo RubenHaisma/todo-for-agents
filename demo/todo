@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# A stand-in for bin/todo with made-up items, for trying the window without a
+# GitHub account and for the README screenshot:
+#
+#   TODO_CLI=$PWD/demo/todo build/Todo
+#   TODO_CLI=$PWD/demo/todo TODO_SNAPSHOT=docs/window.png build/Todo
+set -euo pipefail
+
+now="$(date +%s)"
+ago() { date -u -r $((now - $1)) +%Y-%m-%dT%H:%M:%SZ; }
+
+item() { # ref title personal updated-seconds-ago labels-json colors-json waiting-json
+  local repo="${1%#*}" num="${1##*#}"
+  printf '{"ref":"%s","repo":"%s","number":%s,"title":"%s","url":"https://github.com/%s/issues/%s","updatedAt":"%s","personal":%s,"labels":%s,"labelColors":%s,"waitingOn":%s}' \
+    "$1" "$repo" "$num" "$2" "$repo" "$num" "$(ago "$4")" "$3" "$5" "$6" "$7"
+}
+
+case "${1:-list}" in
+  list|--json)
+    printf '[%s]\n' "$(
+      item "you/todo#14" "Write the launch post for the new pricing page" true 1500 '[]' '{}' '[]'; printf ,
+      item "acme/api#212" "Rate-limit the public search endpoint" false 600 '["status: in review"]' '{"status: in review":"FBCA04"}' '[]'; printf ,
+      item "acme/web#88" "Fix the flaky checkout test on Safari" false 3000 '["status: in progress"]' '{"status: in progress":"0E8A16"}' '[]'; printf ,
+      item "you/todo#12" "Renew the certificate for status.example.com" true 7200 '["urgent"]' '{"urgent":"D93F0B"}' '[]'; printf ,
+      item "acme/web#91" "Dark mode for the settings page" false 18000 '["status: todo"]' '{"status: todo":"C5DEF5"}' '[]'; printf ,
+      item "acme/infra#40" "Move nightly backups to a second region" false 90000 '["priority: high"]' '{"priority: high":"B60205"}' '[]'; printf ,
+      item "you/todo#9" "Book flights for the March offsite" true 260000 '[]' '{}' '[]'; printf ,
+      item "acme/api#205" "Pagination for /v2/orders" false 400000 '[]' '{}' '["jdoe"]'
+    )"
+    ;;
+  claims)
+    cat <<JSON
+[
+  {"ref":"acme/api#212","agent":"claude","session":"5f0c2a9e-demo","since":$((now - 2900)),"lastActive":$((now - 20)),"active":true},
+  {"ref":"you/todo#14","agent":"codex","session":"019a6b2c-demo","since":$((now - 1500)),"lastActive":$((now - 45)),"active":true},
+  {"ref":"acme/web#88","agent":"claude","session":"a81d77f3-demo","since":$((now - 4800)),"lastActive":$((now - 540)),"active":false}
+]
+JSON
+    ;;
+  open) open "https://github.com" ;;
+  *) echo "demo: todo $* (nothing changes in the demo)" ;;
+esac

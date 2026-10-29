@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# todo — a to-do list shared with your coding agents, backed by GitHub issues.
+#
+# The list = every open issue in the personal repo ($TODO_REPO)
+#          + every open issue assigned to or created by you anywhere else.
+# The floating window (Todo.app) shows the same list and refreshes the moment
+# this script changes something. Claude and Codex use this script, not raw gh,
+# and claim the item they work on so the window shows who is on what.
+#
+# Written for macOS /bin/bash 3.2: no associative arrays, no mapfile.
+set -euo pipefail
+
+# Your personal to-do repo (owner/name), set in the config file below.
+TODO_REPO="${TODO_REPO:-}"
+# Repos whose assigned issues are stale noise. Space-separated owner/name.
+TODO_HIDE="${TODO_HIDE:-}"
+TODO_NOTIFY="com.rubenhaisma.todo.changed"
+TODO_NOTIFY_CLAIMS="com.rubenhaisma.todo.claims"
+# `todo start` opens a session in the issue's repo checkout, found under these
+# roots; personal items and repos without a checkout open in TODO_DIR.
+TODO_ROOTS="${TODO_ROOTS:-$HOME/Developer $HOME/Projects $HOME/code $HOME/src}"
+TODO_DIR="${TODO_DIR:-$HOME}"
+TODO_AGENT="${TODO_AGENT:-claude}"
+TODO_CHECKOUTS="${XDG_CACHE_HOME:-$HOME/.cache}/todo/checkouts"
+# One file per agent session: the item it works on (`todo claim`).
+TODO_CLAIMS="${XDG_STATE_HOME:-$HOME/.local/state}/todo/claims"
+# A claim lapses after this long without activity in its session (12 h).
+TODO_CLAIM_TTL="${TODO_CLAIM_TTL:-43200}"
+# A session counts as active while its transcript changed this recently.
+TODO_ACTIVE_SECS="${TODO_ACTIVE_SECS:-120}"
+
+TODO_CONFIG="${TODO_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/todo/config}"
+# Local settings (TODO_REPO / TODO_HIDE / TODO_ROOTS / ...) without editing this file.
+if [ -f "$TODO_CONFIG" ]; then
+  # shellcheck source=/dev/null
+  . "$TODO_CONFIG"
+fi
+
+TAB="$(printf '\t')"
+# Claim files separate fields with the unit separator: unlike a tab, read keeps
+# empty fields (a Codex claim has no PID) instead of folding them together.
+SEP="$(printf '\037')"
+
+die() { echo "todo: $*" >&2; exit 1; }
+
+require_repo() {
+  case "$TODO_REPO" in
+    */*) ;;
+    *) die "no to-do repo set: run install.sh, or put TODO_REPO=owner/name in $TODO_CONFIG" ;;
+  esac
+}
+
+usage() {
+  local repo="${TODO_REPO:-your to-do repo}"
+  cat <<EOF
+todo — your to-do list (GitHub issues), shared with your agents. Personal
+items live in $repo; open issues assigned to or created by you in any
+other repo show up too ("→ name" = created by you, held by someone else;
+"▶ claude" = an agent session is working on it).
+
+  todo [list] [--json]              open items, one per line with a ref
+  todo add <title> [-b body | -F file] [-r owner/repo] [-l label]...
+                                    new issue assigned to you (default repo: $repo);
+                                    -F - reads the body from stdin
+  todo note <ref> <text>            add a progress comment
+  todo done <ref> [-m comment] [--force]
+                                    close it; --force is needed outside $repo
+  todo reopen <ref>                 reopen a closed item
+  todo show <ref>                   print the issue with its comments
+  todo open [<ref>]                 open it (or the whole list) in the browser
+  todo start <ref> [--claude | --codex]
+                                    new Claude Code or Codex session in the repo's
+                                    folder, with the issue as the prompt (default: $TODO_AGENT)
+  todo where <ref>                  the local folder work on <ref> happens in
+  todo index                        rescan $TODO_ROOTS for repo checkouts
+  todo rules                        the instructions to give your agents (CLAUDE.md / AGENTS.md)
+
+  todo claim <ref>                  mark <ref> as what this agent session works on
+                                    (one per session: a new claim replaces the old)
+  todo release [<ref>]              drop this session's claim, or every claim on <ref>
+  todo claims [--json]              who works on what; claims lapse when the session
+                                    ends or after $((TODO_CLAIM_TTL / 3600)) h without activity
+
+<ref> is 12 (= $repo#12), owner/repo#12, or an issue URL.
+EOF
+}
+
+# The instructions agents need, for CLAUDE.md / AGENTS.md: `todo rules >> ~/.claude/CLAUDE.md`.
+agent_rules() {
+  cat <<'EOF'
+## To-do list
+
+My to-do list is GitHub issues, managed with the `todo` CLI (`todo help`). It
+holds every open issue in my personal to-do repo plus every open issue assigned
+to or created by me in any repo, and a floating window shows it.
+
+- **Everything starts as an issue.** Before starting work, run `todo` to find
+  the item it belongs to; otherwise create one with
+  `todo add "<title>" -b "<context and what done looks like>" -r <owner/repo>`
+  (the project's repo when the work belongs to one, my to-do repo otherwise).
+  Name the ref in your reply. A question answered in the same turn needs none.
+- **Claim what you work on.** Run `todo claim <ref>` when you start on an item,
+  so the window shows you working on it. A new claim replaces your old one;
+  run `todo release` when you stop or hand it back.
+- **Keep it current.** `todo note <ref> "<progress, PR link, blocker>"` when
+  something changes, and `Fixes owner/repo#N` in PRs. Close personal items with
+  `todo done <ref> -m "<outcome>"`; issues in team repos are closed by their
+  reviewer or the merged PR.
+- **Use `todo`, not raw `gh issue`**, so the window refreshes at once.
+EOF
+}
+
+# Parse a ref into REF_REPO and REF_NUM.
+parse_ref() {
+  local ref="${1:-}"
+  [ -n "$ref" ] || die "missing <ref>"
+  case "$ref" in
+    https://github.com/*/issues/*)
+      local path="${ref#https://github.com/}"
+      REF_REPO="${path%%/issues/*}"
+      REF_NUM="${path##*/issues/}"
+      REF_NUM="${REF_NUM%%[/?#]*}"
+      ;;
+    *#*)
+      REF_REPO="${ref%%#*}"
+      REF_NUM="${ref##*#}"
+      [ -n "$REF_REPO" ] || REF_REPO="$TODO_REPO"
+      ;;
+    *)
+      REF_REPO="$TODO_REPO"
+      REF_NUM="$ref"
+      ;;
+  esac
+  case "$REF_NUM" in
+    ''|*[!0-9]*) die "not an issue ref: $ref" ;;
+  esac
+  case "$REF_REPO" in
+    */*) ;;
+    *) die "not an issue ref: $ref (use owner/repo#N)" ;;
+  esac
+}
+
+# Tell the floating window to refresh now instead of on its next poll.
+changed() { /usr/bin/notifyutil -p "$TODO_NOTIFY" >/dev/null 2>&1 || true; }
+claims_changed() { /usr/bin/notifyutil -p "$TODO_NOTIFY_CLAIMS" >/dev/null 2>&1 || true; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# --- Claims: which agent session works on which item -----------------------
+
+first_match() { if [ -e "$1" ]; then printf '%s' "$1"; fi; }
+
+# Sets SESSION_AGENT and SESSION_ID for the agent running this command, plus
+# SESSION_PID (a process that lives as long as the session) and SESSION_LOG
+# (the transcript the agent appends to, which dates its last activity) where
+# the agent has them. TODO_SESSION / TODO_AGENT_NAME name other agents.
+detect_session() {
+  SESSION_PID=""
+  SESSION_LOG=""
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    SESSION_AGENT=claude
+    SESSION_ID="$CLAUDE_CODE_SESSION_ID"
+    SESSION_PID="${CLAUDE_PID:-}"
+    SESSION_LOG="$(first_match "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$SESSION_ID".jsonl)"
+  elif [ -n "${CODEX_THREAD_ID:-}" ]; then
+    # One Codex app process serves every thread, so there is no PID to watch.
+    SESSION_AGENT=codex
+    SESSION_ID="$CODEX_THREAD_ID"
+    SESSION_LOG="$(first_match "${CODEX_HOME:-$HOME/.codex}"/sessions/*/*/*/rollout-*-"$SESSION_ID".jsonl)"
+  else
+    SESSION_AGENT="${TODO_AGENT_NAME:-you}"
+    SESSION_ID="${TODO_SESSION:-$SESSION_AGENT}"
+  fi
+}
+
+claim_file() {
+  printf '%s/%s' "$TODO_CLAIMS" "$(printf '%s-%s' "$SESSION_AGENT" "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# Drop every claim on owner/repo#N (GitHub names ignore case).
+release_ref() {
+  local f ref want
+  want="$(lower "$1")"
+  for f in "$TODO_CLAIMS"/*; do
+    [ -f "$f" ] || continue
+    IFS="$SEP" read -r ref _ <"$f" || continue
+    if [ "$(lower "$ref")" = "$want" ]; then rm -f "$f"; fi
+  done
+}
+
+# Live claims as a JSON array. A claim lapses (and its file goes) when its
+# session's process has exited, its transcript is gone, or nothing happened
+# in the session for TODO_CLAIM_TTL seconds.
+claims_json() {
+  local now f ref agent session pid since log last mtime
+  now="$(date +%s)"
+  for f in "$TODO_CLAIMS"/*; do
+    [ -f "$f" ] || continue
+    IFS="$SEP" read -r ref agent session pid since log <"$f" || continue
+    case "$since" in ''|*[!0-9]*) rm -f "$f"; continue ;; esac
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -f "$f"; continue; fi
+    last="$since"
+    if [ -n "$log" ]; then
+      if ! mtime="$(stat -f %m "$log" 2>/dev/null)"; then rm -f "$f"; continue; fi
+      if [ "$mtime" -gt "$last" ]; then last="$mtime"; fi
+    fi
+    if [ $((now - last)) -gt "$TODO_CLAIM_TTL" ]; then rm -f "$f"; continue; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ref" "$agent" "$session" "$since" "$last"
+  done | jq -R -s --argjson now "$now" --argjson window "$TODO_ACTIVE_SECS" '
+    split("\n") | map(select(length > 0) | split("\t")
+      | {ref: .[0], agent: .[1], session: .[2], since: (.[3] | tonumber), lastActive: (.[4] | tonumber)}
+      | . + {active: ($now - .lastActive <= $window)})
+    | sort_by(0 - .lastActive)'
+}
+
+cmd_claim() {
+  parse_ref "${1:-}"
+  detect_session
+  mkdir -p "$TODO_CLAIMS"
+  local ref file since old old_since
+  ref="$REF_REPO#$REF_NUM"
+  file="$(claim_file)"
+  since="$(date +%s)"
+  # Claiming the same item again keeps its start time.
+  if [ -f "$file" ] && IFS="$SEP" read -r old _ _ _ old_since _ <"$file" && [ "$(lower "$old")" = "$(lower "$ref")" ]; then
+    since="$old_since"
+  fi
+  printf "%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s\n" "$ref" "$SESSION_AGENT" "$SESSION_ID" "$SESSION_PID" "$since" "$SESSION_LOG" \
+    >"$file.tmp"
+  mv "$file.tmp" "$file"
+  claims_changed
+  echo "$SESSION_AGENT is working on $REF_REPO#$REF_NUM; run 'todo release' when you stop"
+}
+
+cmd_release() {
+  if [ -n "${1:-}" ]; then
+    parse_ref "$1"
+    release_ref "$REF_REPO#$REF_NUM"
+    echo "released $REF_REPO#$REF_NUM"
+  else
+    detect_session
+    local file
+    file="$(claim_file)"
+    if [ -f "$file" ]; then
+      rm -f "$file"
+      echo "released $SESSION_AGENT's claim"
+    else
+      echo "$SESSION_AGENT has no claim"
+    fi
+  fi
+  claims_changed
+}
+
+cmd_claims() {
+  if [ "${1:-}" = "--json" ]; then
+    claims_json
+    return
+  fi
+  claims_json | jq -r --argjson now "$(date +%s)" '
+    if length == 0 then "no agent is working on anything" else .[] |
+      "\(.ref)\t\(.agent)\t\(if .active then "active" else "idle \(($now - .lastActive) / 60 | floor)m" end)\tsince \(.since | strflocaltime("%H:%M"))"
+    end' | column -t -s "$TAB"
+}
+
+list_json() {
+  local tmp
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" EXIT
+
+  # Personal repo: read directly (consistent at once). Everything else comes
+  # from search, which lags writes by a few seconds but spans all repos.
+  # Search can't OR assignee and author, so those are two queries.
+  local excludes=("-repo:$TODO_REPO")
+  local r
+  for r in $TODO_HIDE; do excludes+=("-repo:$r"); done
+  local fields=number,title,url,labels,updatedAt,repository,assignees
+
+  gh issue list -R "$TODO_REPO" --state open --limit 200 \
+    --json number,title,url,labels,updatedAt >"$tmp/personal" 2>"$tmp/personal.err" &
+  local p_pid=$!
+  gh search issues --assignee @me --state open --limit 200 --json "$fields" \
+    -- "${excludes[@]}" >"$tmp/assigned" 2>"$tmp/assigned.err" &
+  local a_pid=$!
+  gh search issues --author @me --state open --limit 200 --json "$fields" \
+    -- "${excludes[@]}" >"$tmp/authored" 2>"$tmp/authored.err" &
+  local o_pid=$!
+
+  claims_json >"$tmp/claims"
+  wait "$p_pid" || die "gh issue list failed: $(cat "$tmp/personal.err")"
+  wait "$a_pid" || die "gh search (assigned) failed: $(cat "$tmp/assigned.err")"
+  wait "$o_pid" || die "gh search (authored) failed: $(cat "$tmp/authored.err")"
+
+  # An issue you created but someone else holds gets waitingOn = their logins;
+  # working lists the agent sessions that claimed it.
+  jq -n --arg repo "$TODO_REPO" --slurpfile p "$tmp/personal" \
+    --slurpfile a "$tmp/assigned" --slurpfile o "$tmp/authored" --slurpfile c "$tmp/claims" '
+    [ ($p[0][] | {repo: $repo, personal: true, mine: true, assignees: []} + .),
+      ($a[0][] | {repo: .repository.nameWithOwner, personal: false, mine: true} + del(.repository)),
+      ($o[0][] | {repo: .repository.nameWithOwner, personal: false, mine: false} + del(.repository)) ]
+    | group_by(.url) | map(sort_by(.mine) | last)
+    | map({
+        ref: "\(.repo)#\(.number)",
+        repo, number, title, url, updatedAt, personal,
+        labels: [.labels[].name],
+        labelColors: ([.labels[] | {(.name): .color}] | add // {}),
+        waitingOn: (if .mine then [] else [.assignees[].login] end)
+      })
+    | map((.ref | ascii_downcase) as $r
+          | .working = [$c[0][] | select((.ref | ascii_downcase) == $r) | del(.ref)])'
+}
+
+cmd_list() {
+  if [ "${1:-}" = "--json" ]; then
+    list_json
+    return
+  fi
+  # What agents are working on first, then personal items, then the rest by
+  # most recent activity, then what is waiting on someone else. Team issues
+  # carry many labels; only status and high priority are worth a glance.
+  list_json | jq -r '
+    sort_by([(if (.working | length) > 0 then 0 elif .personal then 1
+              elif (.waitingOn | length) == 0 then 2 else 3 end),
+             (0 - (.updatedAt | fromdate))])
+    | if length == 0 then "nothing open" else .[] |
+        ([.working[] | "▶ \(.agent)"]
+         + (if .personal then .labels
+            else [.labels[] | select(startswith("status: ") or . == "priority: high")] end)
+         + [.waitingOn[] | "→ \(.)"]) as $l
+        | "\(.ref)\t\(.title)\(if ($l | length) > 0 then "  [\($l | join(", "))]" else "" end)"
+      end' | column -t -s "$(printf '\t')"
+}
+
+cmd_add() {
+  local title="" body="" body_file="" repo="$TODO_REPO"
+  local labels=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b|--body) body="${2:-}"; shift 2 ;;
+      -F|--body-file) body_file="${2:-}"; shift 2 ;;
+      -r|--repo) repo="${2:-}"; shift 2 ;;
+      -l|--label) labels+=(--label "${2:-}"); shift 2 ;;
+      -*) die "unknown option for add: $1" ;;
+      *) [ -z "$title" ] || die "title given twice; quote it"; title="$1"; shift ;;
+    esac
+  done
+  [ -n "$title" ] || die "usage: todo add <title> [-b body | -F file] [-r owner/repo] [-l label]"
+
+  local body_args=(--body "$body")
+  [ -z "$body_file" ] || body_args=(--body-file "$body_file")
+  local url
+  url="$(gh issue create -R "$repo" --title "$title" "${body_args[@]}" --assignee @me \
+    ${labels[@]+"${labels[@]}"})"
+  changed
+  echo "added $repo#${url##*/}  $url"
+}
+
+cmd_note() {
+  parse_ref "${1:-}"
+  local text="${2:-}"
+  [ -n "$text" ] || die "usage: todo note <ref> <text>"
+  gh issue comment "$REF_NUM" -R "$REF_REPO" --body "$text" >/dev/null
+  changed
+  echo "noted on $REF_REPO#$REF_NUM"
+}
+
+cmd_done() {
+  local ref="" comment="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--comment) comment="${2:-}"; shift 2 ;;
+      --force) force=1; shift ;;
+      -*) die "unknown option for done: $1" ;;
+      *) ref="$1"; shift ;;
+    esac
+  done
+  parse_ref "$ref"
+  # Issues in team repos have an owner and a reviewer; the reviewer closes them.
+  if [ "$REF_REPO" != "$TODO_REPO" ] && [ "$force" -ne 1 ]; then
+    die "$REF_REPO#$REF_NUM is not a personal item; its reviewer closes it. Use 'todo note', or --force if you were asked to close it."
+  fi
+  local args=(issue close "$REF_NUM" -R "$REF_REPO" --reason completed)
+  [ -z "$comment" ] || args+=(--comment "$comment")
+  gh "${args[@]}" >/dev/null
+  release_ref "$REF_REPO#$REF_NUM"
+  claims_changed
+  changed
+  echo "closed $REF_REPO#$REF_NUM"
+}
+
+cmd_reopen() {
+  parse_ref "${1:-}"
+  gh issue reopen "$REF_NUM" -R "$REF_REPO" >/dev/null
+  changed
+  echo "reopened $REF_REPO#$REF_NUM"
+}
+
+cmd_show() {
+  parse_ref "${1:-}"
+  gh issue view "$REF_NUM" -R "$REF_REPO" --comments
+}
+
+cmd_open() {
+  if [ -z "${1:-}" ]; then
+    open "https://github.com/$TODO_REPO/issues"
+    return
+  fi
+  parse_ref "$1"
+  open "https://github.com/$REF_REPO/issues/$REF_NUM"
+}
+
+# Rebuild the "owner/repo<TAB>folder" index of main checkouts under TODO_ROOTS.
+# Worktrees (.git is a file) are skipped; with several checkouts of one repo
+# the most recently used one wins.
+index_checkouts() {
+  mkdir -p "$(dirname "$TODO_CHECKOUTS")"
+  local root g d url slug
+  # shellcheck disable=SC2086
+  for root in $TODO_ROOTS; do
+    [ -d "$root" ] || continue
+    find "$root" -maxdepth 3 -name .git -type d -prune 2>/dev/null
+  done | while IFS= read -r g; do
+    d="${g%/.git}"
+    url="$(git config -f "$g/config" --get remote.origin.url 2>/dev/null)" || continue
+    case "$url" in
+      git@github.com:*) slug="${url#git@github.com:}" ;;
+      https://github.com/*) slug="${url#https://github.com/}" ;;
+      ssh://git@github.com/*) slug="${url#ssh://git@github.com/}" ;;
+      *) continue ;;
+    esac
+    slug="${slug%/}"; slug="${slug%.git}"
+    printf '%s\t%s\t%s\n' "$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')" \
+      "$(stat -f %m "$g/index" 2>/dev/null || echo 0)" "$d"
+  done | sort -t "$(printf '\t')" -k1,1 -k2,2nr | awk -F '\t' '!seen[$1]++ { print $1 "\t" $3 }' \
+    >"$TODO_CHECKOUTS.tmp"
+  mv "$TODO_CHECKOUTS.tmp" "$TODO_CHECKOUTS"
+}
+
+lookup_checkout() {
+  local key
+  key="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [ -f "$TODO_CHECKOUTS" ] || return 1
+  awk -F '\t' -v k="$key" '$1 == k { print $2; found = 1; exit } END { exit !found }' "$TODO_CHECKOUTS"
+}
+
+# Sets WORK_DIR for REF_REPO. Rescans once on a miss, for repos cloned since.
+# The window sets TODO_NO_SCAN: touching ~/Documents from Todo.app would raise a
+# macOS folder-access prompt for the app, so there it only reads the index.
+resolve_dir() {
+  WORK_DIR="$TODO_DIR"
+  [ "$REF_REPO" != "$TODO_REPO" ] || return 0
+  local dir
+  if dir="$(lookup_checkout "$REF_REPO")" && { [ -n "${TODO_NO_SCAN:-}" ] || [ -d "$dir" ]; }; then
+    WORK_DIR="$dir"; return 0
+  fi
+  if [ -z "${TODO_NO_SCAN:-}" ]; then
+    index_checkouts
+    if dir="$(lookup_checkout "$REF_REPO")"; then WORK_DIR="$dir"; return 0; fi
+  fi
+  echo "todo: no checkout of $REF_REPO in the index (todo index); using $TODO_DIR" >&2
+}
+
+cmd_where() {
+  parse_ref "${1:-}"
+  resolve_dir
+  echo "$WORK_DIR"
+}
+
+uri() { jq -rn --arg s "$1" '$s | @uri'; }
+
+cmd_start() {
+  local ref="" agent="$TODO_AGENT"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --claude) agent=claude; shift ;;
+      --codex) agent=codex; shift ;;
+      -*) die "unknown option for start: $1" ;;
+      *) ref="$1"; shift ;;
+    esac
+  done
+  parse_ref "$ref"
+  local title
+  title="$(gh issue view "$REF_NUM" -R "$REF_REPO" --json title --jq .title)"
+  resolve_dir
+  local prompt
+  prompt="Work on $REF_REPO#$REF_NUM: $title
+https://github.com/$REF_REPO/issues/$REF_NUM
+
+Start with \`todo claim $REF_REPO#$REF_NUM\` so the to-do window shows you on it, then read the issue and its comments with \`todo show $REF_REPO#$REF_NUM\`. Keep it current with \`todo note\`, and run \`todo release\` when you stop."
+  # The desktop apps' own deep links: a new session in that folder with the
+  # prompt filled in, waiting for you to send it.
+  case "$agent" in
+    claude) open "claude://code/new?q=$(uri "$prompt")&folder=$(uri "$WORK_DIR")" ;;
+    codex) open "codex://threads/new?prompt=$(uri "$prompt")&path=$(uri "$WORK_DIR")" ;;
+    *) die "unknown agent: $agent (use claude or codex)" ;;
+  esac
+  echo "started $agent on $REF_REPO#$REF_NUM in $WORK_DIR"
+}
+
+sub="${1:-list}"
+[ $# -eq 0 ] || shift
+case "$sub" in
+  help|-h|--help|rules|claims|release|index) ;;
+  *) require_repo ;;
+esac
+case "$sub" in
+  list|ls) cmd_list "$@" ;;
+  --json) cmd_list --json ;;
+  add|new) cmd_add "$@" ;;
+  note|comment) cmd_note "$@" ;;
+  done|close) cmd_done "$@" ;;
+  reopen) cmd_reopen "$@" ;;
+  show|view) cmd_show "$@" ;;
+  open|web) cmd_open "$@" ;;
+  start|do) cmd_start "$@" ;;
+  where) cmd_where "$@" ;;
+  index) index_checkouts; echo "$(wc -l <"$TODO_CHECKOUTS" | tr -d ' ') checkouts in $TODO_CHECKOUTS" ;;
+  claim|working) cmd_claim "$@" ;;
+  release|unclaim) cmd_release "$@" ;;
+  claims) cmd_claims "$@" ;;
+  rules) agent_rules ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
