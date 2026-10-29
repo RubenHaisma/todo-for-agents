@@ -1,9 +1,9 @@
 # todo for agents
 
 A to-do list you share with your coding agents. The items are GitHub issues,
-Claude Code and Codex read and update them through a small `todo` CLI, and an
-always-on-top macOS window shows the list, including which agent is working on
-what right now.
+Claude Code and Codex read and update them through a small `todo` CLI, and a
+small always-on-top macOS window shows how many are open and which agent is
+working on what right now. Click it for the list.
 
 <img src="docs/window.png" width="320" alt="The to-do window: three items in progress, with a Claude or Codex badge each, above the rest of the list">
 
@@ -14,8 +14,8 @@ what right now.
 - **Agents keep it current.** They add an issue before they start work, claim
   it, leave progress notes and close it when done.
 - **See who is on what.** An item an agent has claimed moves to In progress
-  with a badge for that agent. A pulsing green dot means the session did
-  something in the last two minutes; a grey dot means it is idle.
+  with a badge for that agent. A green dot means the session did something
+  in the last two minutes; a grey dot means it is idle.
 
 ## Install
 
@@ -115,6 +115,15 @@ transcript did not change (`TODO_CLAIM_TTL`, in seconds). Claims are files in
 
 ## The window
 
+<img src="docs/pill.png" width="90" alt="The folded window: a checklist icon, the number 7 and three coloured dots">
+
+- Folded, it is a pill in a corner of the screen: the number of open items
+  and a dot per agent session at work, in that agent's colour (faded when the
+  session is idle). Hover it to see who is on what; drag it to move it.
+- Click the pill for the list. It opens from the pill's corner towards the
+  middle of the screen, and folds back when you click another app, after Do
+  now, or on Esc in the empty add field. The pin keeps it open; the chevron
+  folds it.
 - Newest first. The clock button switches to groups per repo. "Waiting on
   others" is always last.
 - Each repo has its own colour; labels keep their GitHub colours. The age

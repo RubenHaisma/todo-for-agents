@@ -1,5 +1,7 @@
 // Todo.app — a small always-on-top window over your to-do list.
 //
+// Folded, the window is a pill with the item count and a dot per agent session
+// at work; a click opens the list, and clicking another app folds it again.
 // The window is a thin view over the `todo` CLI (bin/todo): it reads
 // `todo list --json` and writes through `todo add` / `todo done`, so the list
 // logic lives in one place. It refreshes every minute and immediately when the
@@ -245,10 +247,13 @@ final class Store: ObservableObject {
     }
 
     /// Opens a new Claude Code or Codex session in the issue's repo folder.
-    func start(_ item: Item, in agent: Agent) {
+    func start(_ item: Item, in agent: Agent, then: @escaping (Bool) -> Void = { _ in }) {
         guard starting[item.ref] == nil else { return }
         starting[item.ref] = agent
-        perform(["start", item.ref, "--\(agent.rawValue)"]) { _ in self.starting[item.ref] = nil }
+        perform(["start", item.ref, "--\(agent.rawValue)"]) { ok in
+            self.starting[item.ref] = nil
+            then(ok)
+        }
     }
 
     /// Runs a write; the CLI's change notification triggers the refresh.
@@ -272,6 +277,12 @@ final class Store: ObservableObject {
     var ownCount: Int { items.filter { $0.waiting.isEmpty }.count }
 
     func claims(for item: Item) -> [Claim] { claims[item.key] ?? [] }
+
+    /// Agent sessions on items in the list, longest-running first.
+    var working: [(item: Item, claim: Claim)] {
+        items.flatMap { item in claims(for: item).map { (item: item, claim: $0) } }
+            .sorted { $0.claim.since < $1.claim.since }
+    }
 
     /// When an agent last did something on the item, if one claimed it.
     private func lastActive(_ item: Item) -> TimeInterval? { claims(for: item).map(\.lastActive).max() }
@@ -322,26 +333,77 @@ final class Store: ObservableObject {
 
 struct PanelView: View {
     @ObservedObject var store: Store
+    /// Folded into the pill.
     @AppStorage("collapsed") private var collapsed = false
+    /// Stays open when you click another app.
+    @AppStorage("pinned") private var pinned = false
     /// Keys of folded sections, one per line; kept across restarts.
     @AppStorage("foldedGroups") private var foldedGroups = ""
     @AppStorage("byRepo") private var byRepo = false
     @State private var draft = ""
     let onCollapse: (Bool) -> Void
+    /// The pill's width, which the window takes on while folded.
+    let onPillWidth: (CGFloat) -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            if !collapsed {
-                Divider().opacity(0.5)
-                list
-                Divider().opacity(0.5)
-                footer
+        Group {
+            if collapsed {
+                pill
+            } else {
+                VStack(spacing: 0) {
+                    header
+                    Divider().opacity(0.5)
+                    list
+                    Divider().opacity(0.5)
+                    footer
+                }
+                .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
-        .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .ignoresSafeArea()   // the title bar is hidden; don't reserve room for it
         .onChange(of: collapsed) { _, value in onCollapse(value) }
+    }
+
+    /// The count, a dot per agent session at work (faded while idle), and a
+    /// warning when the list didn't load. The window handles clicks and drags.
+    private var pill: some View {
+        let working = store.working
+        return HStack(spacing: 6) {
+            Image(systemName: "checklist")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+            Text("\(store.ownCount)")
+                .font(.system(size: 12, weight: .semibold).monospacedDigit())
+            if store.error != nil {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+            }
+            if !working.isEmpty {
+                HStack(spacing: 3) {
+                    ForEach(working.prefix(5), id: \.claim.session) { work in
+                        // No pulse here: motion at the edge of the screen pulls the eye,
+                        // and it kept the always-on pill redrawing.
+                        Image(systemName: "circle.fill")
+                            .font(.system(size: 7))
+                            .foregroundStyle(work.claim.color.opacity(work.claim.active ? 1 : 0.4))
+                    }
+                    if working.count > 5 {
+                        Text("+\(working.count - 5)")
+                            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .fixedSize()
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { onPillWidth($0) }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .help(([store.error == nil ? "\(store.ownCount) to do" : "Couldn't load the list"]
+               + working.map { "\($0.claim.title) \($0.claim.active ? "busy" : "idle") on \($0.item.ref): \($0.item.title)" }
+               + ["Click to open the list, drag to move it."]).joined(separator: "\n"))
     }
 
     private var header: some View {
@@ -366,15 +428,20 @@ struct PanelView: View {
                          : "Most recent activity first. Click to group by repo.")
             Button { store.refresh("button") } label: {
                 Image(systemName: "arrow.clockwise")
-                    .rotationEffect(.degrees(store.loading ? 360 : 0))
-                    .animation(store.loading ? .linear(duration: 1).repeatForever(autoreverses: false) : .default,
-                               value: store.loading)
+                    // A repeatForever rotation kept running after the refresh
+                    // ended (about 10% CPU); the symbol effect stops with it.
+                    .symbolEffect(.rotate, options: .repeating, isActive: store.loading)
             }
             .help("Refresh")
-            Button { collapsed.toggle() } label: {
-                Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+            Button { pinned.toggle() } label: {
+                Image(systemName: pinned ? "pin.fill" : "pin")
             }
-            .help(collapsed ? "Expand" : "Collapse")
+            .help(pinned ? "Pinned open. Click to fold it when you click another app."
+                         : "Folds into a pill when you click another app. Click to keep it open.")
+            Button { collapsed = true } label: {
+                Image(systemName: "chevron.up")
+            }
+            .help("Fold into the pill")
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
@@ -423,7 +490,8 @@ struct PanelView: View {
                                     closing: store.closing.contains(item.ref),
                                     starting: store.starting[item.ref],
                                     onDone: { store.done(item) },
-                                    onStart: { store.start(item, in: $0) })
+                                    // The new session is where you go next.
+                                    onStart: { store.start(item, in: $0) { ok in if ok && !pinned { collapsed = true } } })
                             }
                         }
                     }
@@ -462,7 +530,8 @@ struct PanelView: View {
                         store.add(draft)
                         draft = ""
                     }
-                    .onExitCommand { draft = "" }
+                    // Esc clears the draft, and folds the window once it's empty.
+                    .onExitCommand { if draft.isEmpty { collapsed = true } else { draft = "" } }
             }
         }
         .padding(.horizontal, 14)
@@ -617,7 +686,7 @@ struct Row: View {
 }
 
 /// "● Claude 12m": an agent session on the item, how long it has been on it,
-/// and whether it is busy right now (pulsing) or idle (grey, how long since).
+/// and whether it is busy right now (green) or idle (grey, how long since).
 struct WorkingBadge: View {
     let claim: Claim
 
@@ -628,8 +697,9 @@ struct WorkingBadge: View {
             HStack(spacing: 3) {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 5.5))
+                    // Not pulsing: a repeating effect kept the open list redrawing
+                    // (about 5% CPU) for as long as any session was busy.
                     .foregroundStyle(claim.active ? Color.green : Color.secondary)
-                    .symbolEffect(.pulse, options: .repeating, isActive: claim.active)
                 Text(claim.title)
                 Text(claim.active ? shortDuration(now - claim.since) : "idle \(shortDuration(now - claim.lastActive))")
                     .monospacedDigit()
@@ -687,9 +757,22 @@ struct Flow: Layout {
 // MARK: - Window and app
 
 final class FloatingPanel: NSPanel {
+    /// Set while the panel is the pill: a click on it calls this, a drag moves it.
+    var onPillClick: (() -> Void)?
+
     // Needed so the "Add a to-do" field takes typing without activating the app.
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func sendEvent(_ event: NSEvent) {
+        guard event.type == .leftMouseDown, let onPillClick else { return super.sendEvent(event) }
+        let start = event.locationInWindow
+        while let next = nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp { return onPillClick() }
+            let p = next.locationInWindow
+            if hypot(p.x - start.x, p.y - start.y) > 3 { return performDrag(with: event) }
+        }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -701,13 +784,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notifyToken: Int32 = 0
     private var claimsToken: Int32 = 0
     private var snapshotSignal: DispatchSourceSignal?
-    private let collapsedHeight: CGFloat = 40
+    private let collapsedHeight: CGFloat = 32
     private let minExpandedHeight: CGFloat = 160
+    /// Measured by the view; this is only until it has been.
+    private var pillWidth: CGFloat = 64
+    /// The corner the list grew from, which the pill goes back to.
+    private var growCorner: (right: Bool, top: Bool)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setvbuf(stdout, nil, _IOLBF, 0)
         makePanel()
         makeStatusItem()
+
+        // Clicking or switching to another app folds the list into the pill.
+        // Mouse events need no Accessibility access to monitor.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            self?.fold("click elsewhere")
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            if let app, app.processIdentifier != getpid() { self?.fold("switched to \(app.localizedName ?? "another app")") }
+        }
 
         store.refresh("launch")
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -791,6 +890,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
+        // The app is never the active one, and the pill's hover text says who
+        // is working on what.
+        panel.allowsToolTipsWhenApplicationIsInactive = true
         panel.becomesKeyOnlyIfNeeded = true
         panel.isMovableByWindowBackground = true
         panel.isOpaque = false
@@ -801,7 +903,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         blur.material = .popover
         blur.blendingMode = .behindWindow
         blur.state = .active
-        let host = NSHostingView(rootView: PanelView(store: store) { [weak self] in self?.setCollapsed($0) })
+        let host = NSHostingView(rootView: PanelView(
+            store: store,
+            onCollapse: { [weak self] in self?.setCollapsed($0) },
+            onPillWidth: { [weak self] in self?.pillWidthChanged($0) }))
         // The window sets its own size. Otherwise the hosting view's minimum
         // height (still the expanded layout's while collapsing) holds the
         // panel open as an empty blurred box.
@@ -820,30 +925,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.setFrameAutosaveName("TodoPanel")
         // The saved frame may predate a collapse; the height follows the state.
-        setCollapsed(UserDefaults.standard.bool(forKey: "collapsed"), animate: false)
+        setCollapsed(UserDefaults.standard.bool(forKey: "collapsed"))
         panel.orderFrontRegardless()
     }
 
-    /// Collapsed, the panel is just the header and only resizes sideways.
-    private func setCollapsed(_ collapsed: Bool, animate: Bool = true) {
-        var frame = panel.frame
-        let top = frame.maxY
+    /// Folded, the panel is the pill, which doesn't resize. The list grows
+    /// from the pill's corner nearest the screen's edges, so it opens towards
+    /// the middle of the screen, and folds back into that corner.
+    private func setCollapsed(_ collapsed: Bool) {
+        let defaults = UserDefaults.standard
+        let old = panel.frame
+        let corner: (right: Bool, top: Bool)
+        var size: NSSize
         if collapsed {
-            if frame.height >= minExpandedHeight {
-                UserDefaults.standard.set(Double(frame.height), forKey: "expandedHeight")
+            if old.height >= minExpandedHeight {
+                defaults.set(Double(old.width), forKey: "expandedWidth")
+                defaults.set(Double(old.height), forKey: "expandedHeight")
             }
-            frame.size.height = collapsedHeight
-            panel.minSize = NSSize(width: 240, height: collapsedHeight)
-            panel.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: collapsedHeight)
+            corner = growCorner ?? nearestCorner(of: old)
+            growCorner = nil
+            size = NSSize(width: pillWidth, height: collapsedHeight)
+            panel.minSize = size
+            panel.maxSize = size
+            panel.onPillClick = { defaults.set(false, forKey: "collapsed") }
         } else {
-            if frame.height < minExpandedHeight {
-                frame.size.height = max(CGFloat(UserDefaults.standard.double(forKey: "expandedHeight")), 240)
+            corner = nearestCorner(of: old)
+            growCorner = corner
+            size = old.size
+            if old.height < minExpandedHeight {
+                size = NSSize(width: max(defaults.double(forKey: "expandedWidth"), 320),
+                              height: max(defaults.double(forKey: "expandedHeight"), 240))
             }
             panel.minSize = NSSize(width: 240, height: minExpandedHeight)
             panel.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            panel.onPillClick = nil
+            store.refreshClaims()
         }
-        frame.origin.y = top - frame.height
-        panel.setFrame(frame, display: true, animate: animate)
+        var frame = NSRect(x: corner.right ? old.maxX - size.width : old.minX,
+                           y: corner.top ? old.maxY - size.height : old.minY,
+                           width: size.width, height: size.height)
+        if let screen = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            frame.origin.x = min(max(frame.minX, screen.minX), screen.maxX - frame.width)
+            frame.origin.y = min(max(frame.minY, screen.minY), screen.maxY - frame.height)
+        }
+        // Not animated: the pill and the list share no content, so a resize
+        // animation shows the one squeezed into the other's frame.
+        panel.setFrame(frame, display: true)
+    }
+
+    private func nearestCorner(of frame: NSRect) -> (right: Bool, top: Bool) {
+        guard let screen = (panel.screen ?? NSScreen.main)?.visibleFrame else { return (true, true) }
+        return (frame.midX > screen.midX, frame.midY > screen.midY)
+    }
+
+    /// The count grew a digit or an agent started: resize the pill in place.
+    private func pillWidthChanged(_ width: CGFloat) {
+        pillWidth = ceil(width)
+        guard UserDefaults.standard.bool(forKey: "collapsed"), panel.frame.width != pillWidth else { return }
+        setCollapsed(true)
+    }
+
+    private func fold(_ reason: String) {
+        let defaults = UserDefaults.standard
+        guard panel.isVisible, !defaults.bool(forKey: "collapsed"), !defaults.bool(forKey: "pinned") else { return }
+        log("folding: \(reason)")
+        defaults.set(true, forKey: "collapsed")
     }
 
     private func makeStatusItem() {
