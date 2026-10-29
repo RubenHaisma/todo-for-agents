@@ -123,7 +123,7 @@ transcript did not change (`TODO_CLAIM_TTL`, in seconds). Claims are files in
 - Click the pill for the list. It opens from the pill's corner towards the
   middle of the screen, and folds back when you click another app, after Do
   now, or on Esc in the empty add field. The pin keeps it open; the chevron
-  folds it.
+  folds it. With Reduce Motion on, it fades instead of growing.
 - Newest first. The clock button switches to groups per repo. "Waiting on
   others" is always last.
 - Each repo has its own colour; labels keep their GitHub colours. The age

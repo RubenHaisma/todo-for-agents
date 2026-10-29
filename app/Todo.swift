@@ -331,8 +331,26 @@ final class Store: ObservableObject {
 
 // MARK: - Views
 
+/// What the window shows. It trails the `collapsed` setting while the window
+/// grows out of the pill or shrinks back into it.
+final class PanelLayout: ObservableObject {
+    static let pillHeight: CGFloat = 32
+    @Published var showsPill = false
+    @Published var showsList = false
+    /// Which of the two is there or on its way: the pill when folded. The
+    /// other one fades out but stays until the window is done moving, so it
+    /// keeps to its corner; a view taken out mid-fade stays where it was.
+    @Published var folded = true
+    /// The list's size while the window grows or shrinks around it, so it is
+    /// uncovered and covered instead of squeezed. Nil: it fills the window.
+    @Published var listSize: CGSize?
+    /// The corner the window grows from and shrinks into; both views keep to it.
+    @Published var anchor = Alignment.topTrailing
+}
+
 struct PanelView: View {
     @ObservedObject var store: Store
+    @ObservedObject var layout: PanelLayout
     /// Folded into the pill.
     @AppStorage("collapsed") private var collapsed = false
     /// Stays open when you click another app.
@@ -346,22 +364,33 @@ struct PanelView: View {
     let onPillWidth: (CGFloat) -> Void
 
     var body: some View {
-        Group {
-            if collapsed {
-                pill
-            } else {
-                VStack(spacing: 0) {
-                    header
-                    Divider().opacity(0.5)
-                    list
-                    Divider().opacity(0.5)
-                    footer
+        // Overlays, so a list bigger than the window spills past its edges
+        // instead of growing the view.
+        Color.clear
+            .overlay(alignment: layout.anchor) {
+                if layout.showsList {
+                    VStack(spacing: 0) {
+                        header
+                        Divider().opacity(0.5)
+                        list
+                        Divider().opacity(0.5)
+                        footer
+                    }
+                    .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .frame(width: layout.listSize?.width, height: layout.listSize?.height)
+                    .opacity(layout.folded ? 0 : 1)
+                    .allowsHitTesting(!layout.folded)
+                    .transition(.asymmetric(insertion: .opacity, removal: .identity))
                 }
-                .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-        }
-        .ignoresSafeArea()   // the title bar is hidden; don't reserve room for it
-        .onChange(of: collapsed) { _, value in onCollapse(value) }
+            .overlay(alignment: layout.anchor) {
+                if layout.showsPill {
+                    pill.opacity(layout.folded ? 1 : 0)
+                        .transition(.asymmetric(insertion: .opacity, removal: .identity))
+                }
+            }
+            .ignoresSafeArea()   // the title bar is hidden; don't reserve room for it
+            .onChange(of: collapsed) { _, value in onCollapse(value) }
     }
 
     /// The count, a dot per agent session at work (faded while idle), and a
@@ -399,7 +428,9 @@ struct PanelView: View {
         .padding(.horizontal, 12)
         .fixedSize()
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { onPillWidth($0) }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Its own height, not the window's, so it stays in its corner while
+        // the window grows.
+        .frame(height: PanelLayout.pillHeight)
         .contentShape(Rectangle())
         .help(([store.error == nil ? "\(store.ownCount) to do" : "Couldn't load the list"]
                + working.map { "\($0.claim.title) \($0.claim.active ? "busy" : "idle") on \($0.item.ref): \($0.item.title)" }
@@ -775,8 +806,30 @@ final class FloatingPanel: NSPanel {
     }
 }
 
+/// The window on its way to a new frame, a step per screen refresh.
+private struct Move {
+    let from, to: NSRect
+    let duration: CFTimeInterval
+    /// Progress for elapsed time, both from 0 to 1.
+    let curve: (Double) -> Double
+    let done: () -> Void
+    /// The first frame drawn, not the call: building the list holds up the
+    /// main thread for a few frames, which would otherwise skip the start.
+    var start: CFTimeInterval?
+
+    static let easeOut: (Double) -> Double = { 1 - pow(1 - $0, 4) }
+    static let easeInOut: (Double) -> Double = { $0 < 0.5 ? 4 * pow($0, 3) : 1 - pow(2 - 2 * $0, 3) / 2 }
+
+    func frame(at progress: Double) -> NSRect {
+        let p = CGFloat(progress)
+        return NSRect(x: from.minX + (to.minX - from.minX) * p, y: from.minY + (to.minY - from.minY) * p,
+                      width: from.width + (to.width - from.width) * p, height: from.height + (to.height - from.height) * p)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = Store()
+    private let layout = PanelLayout()
     private var panel: FloatingPanel!
     private var statusItem: NSStatusItem!
     private var toggleItem: NSMenuItem!
@@ -784,12 +837,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notifyToken: Int32 = 0
     private var claimsToken: Int32 = 0
     private var snapshotSignal: DispatchSourceSignal?
-    private let collapsedHeight: CGFloat = 32
     private let minExpandedHeight: CGFloat = 160
     /// Measured by the view; this is only until it has been.
     private var pillWidth: CGFloat = 64
     /// The corner the list grew from, which the pill goes back to.
     private var growCorner: (right: Bool, top: Bool)?
+    /// Set while the window grows or shrinks. Not AppKit's window animation:
+    /// that one ended at once when the pill appeared, and its clock ran on
+    /// while the list was being built.
+    private var move: Move?
+    private lazy var moveLink: CADisplayLink = {
+        let link = panel.displayLink(target: self, selector: #selector(moveStep))
+        link.add(to: .main, forMode: .common)
+        return link
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setvbuf(stdout, nil, _IOLBF, 0)
@@ -897,7 +958,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = true
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.minSize = NSSize(width: 240, height: collapsedHeight)
+        panel.minSize = NSSize(width: 240, height: PanelLayout.pillHeight)
 
         let blur = NSVisualEffectView()
         blur.material = .popover
@@ -905,6 +966,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         blur.state = .active
         let host = NSHostingView(rootView: PanelView(
             store: store,
+            layout: layout,
             onCollapse: { [weak self] in self?.setCollapsed($0) },
             onPillWidth: { [weak self] in self?.pillWidthChanged($0) }))
         // The window sets its own size. Otherwise the hosting view's minimum
@@ -925,16 +987,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.setFrameAutosaveName("TodoPanel")
         // The saved frame may predate a collapse; the height follows the state.
-        setCollapsed(UserDefaults.standard.bool(forKey: "collapsed"))
+        setCollapsed(UserDefaults.standard.bool(forKey: "collapsed"), animated: false)
         panel.orderFrontRegardless()
     }
 
     /// Folded, the panel is the pill, which doesn't resize. The list grows
     /// from the pill's corner nearest the screen's edges, so it opens towards
     /// the middle of the screen, and folds back into that corner.
-    private func setCollapsed(_ collapsed: Bool) {
+    private func setCollapsed(_ collapsed: Bool, animated: Bool = true) {
         let defaults = UserDefaults.standard
-        let old = panel.frame
+        // Mid-animation, start from where the window was going, so a quick
+        // second click neither saves a passing size nor picks another corner.
+        let old = move?.to ?? panel.frame
         let corner: (right: Bool, top: Bool)
         var size: NSSize
         if collapsed {
@@ -944,9 +1008,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             corner = growCorner ?? nearestCorner(of: old)
             growCorner = nil
-            size = NSSize(width: pillWidth, height: collapsedHeight)
-            panel.minSize = size
-            panel.maxSize = size
+            size = NSSize(width: pillWidth, height: PanelLayout.pillHeight)
             panel.onPillClick = { defaults.set(false, forKey: "collapsed") }
         } else {
             corner = nearestCorner(of: old)
@@ -956,8 +1018,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 size = NSSize(width: max(defaults.double(forKey: "expandedWidth"), 320),
                               height: max(defaults.double(forKey: "expandedHeight"), 240))
             }
-            panel.minSize = NSSize(width: 240, height: minExpandedHeight)
-            panel.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
             panel.onPillClick = nil
             store.refreshClaims()
         }
@@ -968,9 +1028,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             frame.origin.x = min(max(frame.minX, screen.minX), screen.maxX - frame.width)
             frame.origin.y = min(max(frame.minY, screen.minY), screen.maxY - frame.height)
         }
-        // Not animated: the pill and the list share no content, so a resize
-        // animation shows the one squeezed into the other's frame.
-        panel.setFrame(frame, display: true)
+
+        // The window grows out of the pill's corner and shrinks back into it.
+        // The pill and the list share no content, so each keeps its own size
+        // and fades: the list is uncovered and covered, never squeezed.
+        // Reduce Motion skips the resize and keeps only the fade.
+        let moves = animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        layout.anchor = Alignment(horizontal: corner.right ? .trailing : .leading,
+                                  vertical: corner.top ? .top : .bottom)
+        layout.listSize = moves ? (collapsed ? old.size : frame.size) : nil
+        // What leaves fades first, so the two barely overlap.
+        let fade: (out: Animation?, in: Animation?) =
+            !animated ? (nil, nil)
+            : !moves ? (nil, .easeOut(duration: 0.15))
+            : collapsed ? (.easeIn(duration: 0.1), .easeOut(duration: 0.1).delay(0.1))
+            : (.easeOut(duration: 0.08), .easeOut(duration: 0.17).delay(0.05))
+        withAnimation(fade.out) { layout.folded = collapsed }
+        withAnimation(fade.in) {
+            if collapsed { layout.showsPill = true } else { layout.showsList = true }
+        }
+        let gone = { [layout] in if collapsed { layout.showsList = false } else { layout.showsPill = false } }
+
+        // The pill doesn't resize; the list does, down to a few rows. Set once
+        // the window is there: an animated frame keeps to these limits too.
+        let limits = collapsed
+            ? (min: size, max: size)
+            : (min: NSSize(width: 240, height: minExpandedHeight),
+               max: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude))
+        guard moves else {
+            move = nil
+            gone()
+            (panel.minSize, panel.maxSize) = limits
+            return panel.setFrame(frame, display: true)
+        }
+        panel.minSize = NSSize(width: min(old.width, size.width), height: min(old.height, size.height))
+        panel.maxSize = NSSize(width: max(old.width, size.width), height: max(old.height, size.height))
+        move = Move(from: panel.frame, to: frame, duration: collapsed ? 0.2 : 0.24,
+                    curve: collapsed ? Move.easeInOut : Move.easeOut) { [weak self] in
+            guard let self else { return }
+            gone()
+            (self.panel.minSize, self.panel.maxSize) = limits
+            if collapsed {
+                // The count may have changed while the list was open.
+                self.pillWidthChanged(self.pillWidth)
+            } else {
+                self.layout.listSize = nil   // from here on it follows the window
+            }
+        }
+        moveLink.isPaused = false
+    }
+
+    @objc private func moveStep(_ link: CADisplayLink) {
+        guard var step = move else { return link.isPaused = true }
+        let start = step.start ?? link.timestamp
+        step.start = start
+        let elapsed = min((link.targetTimestamp - start) / step.duration, 1)
+        guard elapsed < 1 else {
+            move = nil
+            link.isPaused = true
+            panel.setFrame(step.to, display: true)
+            return step.done()
+        }
+        move = step
+        panel.setFrame(step.frame(at: step.curve(elapsed)), display: true)
     }
 
     private func nearestCorner(of frame: NSRect) -> (right: Bool, top: Bool) {
@@ -981,8 +1101,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The count grew a digit or an agent started: resize the pill in place.
     private func pillWidthChanged(_ width: CGFloat) {
         pillWidth = ceil(width)
-        guard UserDefaults.standard.bool(forKey: "collapsed"), panel.frame.width != pillWidth else { return }
-        setCollapsed(true)
+        guard move == nil, UserDefaults.standard.bool(forKey: "collapsed"), panel.frame.width != pillWidth else { return }
+        setCollapsed(true, animated: false)
     }
 
     private func fold(_ reason: String) {
