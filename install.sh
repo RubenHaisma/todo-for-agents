@@ -154,7 +154,15 @@ cat >"$agent" <<EOF
 </plist>
 EOF
 
+old="$({ launchctl print "$domain/$label" 2>/dev/null || true; } | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
 launchctl bootout "$domain/$label" 2>/dev/null || true
+# bootout returns while the old app is still quitting, and bootstrapping then
+# fails now and then with "Input/output error". Wait for it to be gone, for at
+# most 10 seconds.
+for _ in $(seq 50); do
+  { [ -n "$old" ] && kill -0 "$old" 2>/dev/null; } || launchctl print "$domain/$label" >/dev/null 2>&1 || break
+  sleep 0.2
+done
 launchctl bootstrap "$domain" "$agent"
 echo "running; log: $logfile"
 
