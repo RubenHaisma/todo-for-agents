@@ -440,6 +440,13 @@ cmd_reopen() {
 
 cmd_show() {
   parse_ref "${1:-}"
+  if [ -t 1 ]; then
+    gh issue view "$REF_NUM" -R "$REF_REPO" --comments
+    return
+  fi
+  # Without a terminal, --comments prints the comments only, so an agent
+  # would never see the issue itself.
+  gh issue view "$REF_NUM" -R "$REF_REPO"
   gh issue view "$REF_NUM" -R "$REF_REPO" --comments
 }
 

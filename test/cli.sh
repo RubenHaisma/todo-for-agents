@@ -29,7 +29,13 @@ case "$1 $2" in
       *" --author "*) cat "$dir/authored.json" ;;
       *) cat "$dir/assigned.json" ;;
     esac ;;
-  "issue view") echo "Fix the thing" ;;
+  "issue view")
+    case " $* " in
+      *" --json "*) echo "Fix the thing" ;;
+      # Like gh without a terminal: --comments prints the comments only.
+      *" --comments "*) printf 'author:\talex\n--\nOn it\n--\n' ;;
+      *) printf 'title:\tFix the thing\nstate:\tOPEN\n--\nWhat done looks like\n' ;;
+    esac ;;
   "issue create") echo "https://github.com/acme/web/issues/42" ;;
   "issue close"|"issue comment"|"issue reopen") ;;
   *) echo "gh stand-in: unexpected call: gh $*" >&2; exit 1 ;;
@@ -266,6 +272,11 @@ t claims --json
 ok "...and drops its claims" json 'length == 0'
 t "done" acme/web#88 --force
 ok "done --force closes a team issue" logged "issue close 88 -R acme/web --reason completed"
+
+echo "# show"
+t show acme/web#7
+ok "show prints the issue to an agent" line '^title:	Fix the thing$'
+ok "...and its comments after it" line '^On it$'
 
 echo "# notes and new items"
 t note 5 "half way"
