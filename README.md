@@ -28,6 +28,11 @@ gh auth login
 xcode-select --install
 ```
 
+`todo start` and the window's Do now open a session in the
+[Claude desktop app](https://claude.ai/download) or the Codex app, so they
+need one of those. Everything else works with Claude Code or Codex in a
+terminal.
+
 Then:
 
 ```bash
@@ -150,6 +155,12 @@ TODO_CLI=$PWD/demo/todo build/Todo
 
 Set `TODO_SNAPSHOT=window.png` as well to save a picture of the window once
 the list has loaded.
+
+## Tests
+
+`test/cli.sh` runs the CLI against stand-ins for `gh` and `open`, so it needs
+no GitHub account and opens nothing. CI runs it on macOS together with
+ShellCheck and a build of the app.
 
 ## License
 

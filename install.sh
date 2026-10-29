@@ -30,8 +30,12 @@ if [ "${1:-}" = "--uninstall" ]; then
   rm -f "$agent"
   rm -rf "$app"
   # Only our own link, never a different todo on PATH.
-  [ "$(readlink "$bindir/todo" 2>/dev/null)" = "$here/bin/todo" ] && rm -f "$bindir/todo"
-  echo "removed Todo.app, the login item and $bindir/todo"
+  if [ "$(readlink "$bindir/todo" 2>/dev/null)" = "$here/bin/todo" ]; then
+    rm -f "$bindir/todo"
+    echo "removed Todo.app, the login item and $bindir/todo"
+  else
+    echo "removed Todo.app and the login item"
+  fi
   echo "kept your settings ($config) and the issues on GitHub"
   exit 0
 fi

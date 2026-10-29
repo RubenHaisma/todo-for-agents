@@ -1,0 +1,33 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      SCRIPTS: bin/todo install.sh demo/todo test/cli.sh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ShellCheck
+        run: brew install shellcheck
+      - name: Syntax
+        run: for f in $SCRIPTS; do bash -n "$f"; done
+      - name: ShellCheck
+        run: shellcheck -S warning $SCRIPTS
+      - name: CLI tests
+        run: test/cli.sh
+      - name: Build the app
+        run: |
+          plutil -lint app/Info.plist
+          mkdir -p build
+          swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos15.0" \
+            app/Todo.swift -o build/Todo

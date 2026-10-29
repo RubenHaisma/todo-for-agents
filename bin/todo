@@ -145,6 +145,8 @@ changed() { /usr/bin/notifyutil -p "$TODO_NOTIFY" >/dev/null 2>&1 || true; }
 claims_changed() { /usr/bin/notifyutil -p "$TODO_NOTIFY_CLAIMS" >/dev/null 2>&1 || true; }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# Whether REF_REPO is the personal to-do repo (GitHub names ignore case).
+is_personal() { [ "$(lower "$REF_REPO")" = "$(lower "$TODO_REPO")" ]; }
 
 # --- Claims: which agent session works on which item -----------------------
 
@@ -376,7 +378,7 @@ cmd_done() {
   done
   parse_ref "$ref"
   # Issues in team repos have an owner and a reviewer; the reviewer closes them.
-  if [ "$REF_REPO" != "$TODO_REPO" ] && [ "$force" -ne 1 ]; then
+  if ! is_personal && [ "$force" -ne 1 ]; then
     die "$REF_REPO#$REF_NUM is not a personal item; its reviewer closes it. Use 'todo note', or --force if you were asked to close it."
   fi
   local args=(issue close "$REF_NUM" -R "$REF_REPO" --reason completed)
@@ -448,7 +450,7 @@ lookup_checkout() {
 # macOS folder-access prompt for the app, so there it only reads the index.
 resolve_dir() {
   WORK_DIR="$TODO_DIR"
-  [ "$REF_REPO" != "$TODO_REPO" ] || return 0
+  ! is_personal || return 0
   local dir
   if dir="$(lookup_checkout "$REF_REPO")" && { [ -n "${TODO_NO_SCAN:-}" ] || [ -d "$dir" ]; }; then
     WORK_DIR="$dir"; return 0
@@ -489,11 +491,14 @@ https://github.com/$REF_REPO/issues/$REF_NUM
 Start with \`todo claim $REF_REPO#$REF_NUM\` so the to-do window shows you on it, then read the issue and its comments with \`todo show $REF_REPO#$REF_NUM\`. Keep it current with \`todo note\`, and run \`todo release\` when you stop."
   # The desktop apps' own deep links: a new session in that folder with the
   # prompt filled in, waiting for you to send it.
+  local url app
   case "$agent" in
-    claude) open "claude://code/new?q=$(uri "$prompt")&folder=$(uri "$WORK_DIR")" ;;
-    codex) open "codex://threads/new?prompt=$(uri "$prompt")&path=$(uri "$WORK_DIR")" ;;
+    claude) url="claude://code/new?q=$(uri "$prompt")&folder=$(uri "$WORK_DIR")"; app="the Claude desktop app" ;;
+    codex) url="codex://threads/new?prompt=$(uri "$prompt")&path=$(uri "$WORK_DIR")"; app="the Codex app" ;;
     *) die "unknown agent: $agent (use claude or codex)" ;;
   esac
+  open "$url" 2>/dev/null ||
+    die "no app opens ${url%%:*}:// links. Install $app, or start $agent yourself in $WORK_DIR"
   echo "started $agent on $REF_REPO#$REF_NUM in $WORK_DIR"
 }
 
