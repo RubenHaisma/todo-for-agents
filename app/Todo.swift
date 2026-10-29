@@ -61,9 +61,23 @@ struct Claim: Decodable, Hashable {
     let lastActive: TimeInterval
     /// The session did something in the last couple of minutes.
     let active: Bool
+    /// What a click opens, as `todo claim` found it: a link to the session in
+    /// the Claude or Codex app, or the path of the app the agent runs in.
+    let open: String?
 
     var title: String { Agent(rawValue: agent)?.title ?? agent.capitalized }
     var color: Color { Agent(rawValue: agent)?.color ?? .secondary }
+
+    /// Only the links the CLI writes, or an app: a claim file is no reason to
+    /// open anything else.
+    var target: URL? {
+        guard let open else { return nil }
+        if open.hasPrefix("/") {
+            return open.hasSuffix(".app") && FileManager.default.fileExists(atPath: open) ? URL(fileURLWithPath: open) : nil
+        }
+        let links = "^(claude://code/continue\\?session=local_[A-Za-z0-9-]{1,64}|codex://threads/[A-Za-z0-9-]+)$"
+        return open.range(of: links, options: .regularExpression) != nil ? URL(string: open) : nil
+    }
 }
 
 enum Agent: String {
@@ -254,6 +268,13 @@ final class Store: ObservableObject {
             self.starting[item.ref] = nil
             then(ok)
         }
+    }
+
+    /// Brings an agent's session forward; false when there is nowhere to go.
+    func open(_ claim: Claim) -> Bool {
+        guard let url = claim.target else { return false }
+        log("opening \(claim.agent) session \(claim.session.prefix(8)): \(url.absoluteString)")
+        return NSWorkspace.shared.open(url)
     }
 
     /// Runs a write; the CLI's change notification triggers the refresh.
@@ -522,7 +543,8 @@ struct PanelView: View {
                                     starting: store.starting[item.ref],
                                     onDone: { store.done(item) },
                                     // The new session is where you go next.
-                                    onStart: { store.start(item, in: $0) { ok in if ok && !pinned { collapsed = true } } })
+                                    onStart: { store.start(item, in: $0) { ok in if ok && !pinned { collapsed = true } } },
+                                    onOpen: { if store.open($0) && !pinned { collapsed = true } })
                             }
                         }
                     }
@@ -581,6 +603,8 @@ struct Row: View {
     let starting: Agent?
     let onDone: () -> Void
     let onStart: (Agent) -> Void
+    /// Opens a working agent's session.
+    let onOpen: (Claim) -> Void
     @State private var hovering = false
     @Environment(\.colorScheme) private var scheme
 
@@ -597,7 +621,7 @@ struct Row: View {
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                 Flow(spacing: 5) {
-                    ForEach(claims, id: \.session) { WorkingBadge(claim: $0) }
+                    ForEach(claims, id: \.session) { claim in WorkingBadge(claim: claim) { onOpen(claim) } }
                     if showRepo {
                         Text(item.personal ? "#\(item.number)" : "\(item.repo.split(separator: "/").last ?? "")#\(item.number)")
                             .font(.system(size: 10, weight: .semibold).monospacedDigit())
@@ -646,6 +670,11 @@ struct Row: View {
         .onHover { hovering = $0 }
         .onTapGesture { openOnGitHub() }
         .contextMenu {
+            let open = claims.filter { $0.target != nil }
+            ForEach(open, id: \.session) { claim in
+                Button("Open the \(claim.title) session") { onOpen(claim) }
+            }
+            if !open.isEmpty { Divider() }
             Button("Do now in Claude Code") { onStart(.claude) }
             Button("Do now in Codex") { onStart(.codex) }
             Divider()
@@ -720,30 +749,56 @@ struct Row: View {
 /// and whether it is busy right now (green) or idle (grey, how long since).
 struct WorkingBadge: View {
     let claim: Claim
+    let onOpen: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         // The CLI reports activity at each poll; the clock in between ticks here.
         TimelineView(.periodic(from: .now, by: 30)) { context in
             let now = context.date.timeIntervalSince1970
-            HStack(spacing: 3) {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 5.5))
-                    // Not pulsing: a repeating effect kept the open list redrawing
-                    // (about 5% CPU) for as long as any session was busy.
-                    .foregroundStyle(claim.active ? Color.green : Color.secondary)
-                Text(claim.title)
-                Text(claim.active ? shortDuration(now - claim.since) : "idle \(shortDuration(now - claim.lastActive))")
-                    .monospacedDigit()
-                    .opacity(0.75)
+            let about = "\(claim.title) session \(claim.session.prefix(8)) has worked on this since "
+                + "\(Date(timeIntervalSince1970: claim.since).formatted(date: .omitted, time: .shortened))"
+                + (claim.active ? "" : "; last activity \(shortDuration(now - claim.lastActive)) ago")
+            if let target = claim.target {
+                Button(action: onOpen) { badge(now, hovered: hovering) }
+                    .buttonStyle(.plain)
+                    .onHover { hovering = $0 }
+                    .help("\(about). Click to \(Self.verb(for: target)).")
+            } else {
+                badge(now, hovered: false).help(about)
             }
-            .font(.system(size: 10, weight: .semibold))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(Capsule().fill(claim.color.opacity(0.16)))
-            .foregroundStyle(claim.color)
-            .help("\(claim.title) session \(claim.session.prefix(8)) has worked on this since "
-                  + "\(Date(timeIntervalSince1970: claim.since).formatted(date: .omitted, time: .shortened))"
-                  + (claim.active ? "" : "; last activity \(shortDuration(now - claim.lastActive)) ago"))
+        }
+    }
+
+    private func badge(_ now: TimeInterval, hovered: Bool) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 5.5))
+                // Not pulsing: a repeating effect kept the open list redrawing
+                // (about 5% CPU) for as long as any session was busy.
+                .foregroundStyle(claim.active ? Color.green : Color.secondary)
+            Text(claim.title)
+            Text(claim.active ? shortDuration(now - claim.since) : "idle \(shortDuration(now - claim.lastActive))")
+                .monospacedDigit()
+                .opacity(0.75)
+            if hovered {
+                Image(systemName: "arrow.up.forward").font(.system(size: 7, weight: .bold))
+            }
+        }
+        .font(.system(size: 10, weight: .semibold))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .background(Capsule().fill(claim.color.opacity(hovered ? 0.3 : 0.16)))
+        .foregroundStyle(claim.color)
+        .contentShape(Capsule())
+    }
+
+    /// The end of "Click to …" for where the claim leads.
+    static func verb(for target: URL) -> String {
+        switch target.scheme {
+        case "claude": "open it in the Claude app"
+        case "codex": "open it in the Codex app"
+        default: "switch to \(target.deletingPathExtension().lastPathComponent), where it runs"
         }
     }
 }

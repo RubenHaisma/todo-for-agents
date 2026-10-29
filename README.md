@@ -15,7 +15,8 @@ working on what right now. Click it for the list.
   it, leave progress notes and close it when done.
 - **See who is on what.** An item an agent has claimed moves to In progress
   with a badge for that agent. A green dot means the session did something
-  in the last two minutes; a grey dot means it is idle.
+  in the last two minutes; a grey dot means it is idle. Click the badge to
+  go to that session.
 
 ## Install
 
@@ -113,6 +114,19 @@ Claude Code and Codex claims also lapse after 12 hours in which the session's
 transcript did not change (`TODO_CLAIM_TTL`, in seconds). Claims are files in
 `~/.local/state/todo/claims`, so nothing about them reaches GitHub.
 
+A claim also records where its session can be found, for the badge in the
+window:
+
+| Session | A click on its badge |
+| --- | --- |
+| Claude Code in the Claude desktop app | opens that session in the app |
+| A thread started in the Codex app | opens that thread in the app |
+| Any agent in a terminal or editor | switches to that app (not to the tab) |
+| An agent in tmux or over ssh | nothing; the badge is not a button |
+
+The window only follows `claude://code/continue` and `codex://threads` links
+or opens an installed `.app`, whatever a claim file says.
+
 ## The window
 
 <img src="docs/pill.png" width="90" alt="The folded window: a checklist icon, the number 7 and three coloured dots">
@@ -122,7 +136,7 @@ transcript did not change (`TODO_CLAIM_TTL`, in seconds). Claims are files in
   session is idle). Hover it to see who is on what; drag it to move it.
 - Click the pill for the list. It opens from the pill's corner towards the
   middle of the screen, and folds back when you click another app, after Do
-  now, or on Esc in the empty add field. The pin keeps it open; the chevron
+  now or going to a session, or on Esc in the empty add field. The pin keeps it open; the chevron
   folds it. With Reduce Motion on, it fades instead of growing.
 - Newest first. The clock button switches to groups per repo. "Waiting on
   others" is always last.
@@ -131,6 +145,9 @@ transcript did not change (`TODO_CLAIM_TTL`, in seconds). Claims are files in
 - Hover a row for the Claude and Codex buttons, or right-click it. "Do now"
   opens a new session in that repo's clone with the issue as the prompt. The
   prompt is filled in, not sent: press Enter there to start.
+- Click an agent's badge, or right-click the row, to go to the session that
+  works on it (see [How claims work](#how-claims-work)). Clicking anywhere
+  else on a row opens the issue on GitHub.
 - Click a section title to fold it. The menu bar item hides the window or quits.
 - It refreshes every minute, and at once when `todo` changes something.
 

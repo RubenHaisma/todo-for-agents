@@ -45,7 +45,26 @@ if [ -n "${OPEN_FAIL:-}" ]; then
 fi
 printf '%s' "$1" >"$dir/opened"
 EOF
-chmod +x "$tmp/bin/gh" "$tmp/bin/open"
+cat >"$tmp/bin/ps" <<'EOF'
+#!/usr/bin/env bash
+# ps stand-in: the real process table, with every process renamed so that no
+# app shows up above the test. With an app in ps.app, the test script (which
+# runs every todo command) becomes a CLI in a bundle of its own, like Claude
+# Code's claude.app, and its parent becomes that app.
+dir="$(cd "$(dirname "$0")/.." && pwd)"
+/bin/ps "$@" | awk -v me="$(cat "$dir/ps.pid")" -v app="$(cat "$dir/ps.app" 2>/dev/null)" '
+  { pid[NR] = $1; parent[NR] = $2; if ($1 == me) up = $2 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      comm = "proc"
+      if (app != "" && pid[i] == me) comm = "/Users/me/cli/claude.app/Contents/MacOS/claude"
+      if (app != "" && pid[i] == up) comm = app "/Contents/MacOS/x"
+      print pid[i], parent[i], comm
+    }
+  }'
+EOF
+chmod +x "$tmp/bin/gh" "$tmp/bin/open" "$tmp/bin/ps"
+echo $$ >"$tmp/ps.pid"
 
 cat >"$tmp/personal.json" <<'EOF'
 [{"number": 5, "title": "Personal item", "url": "https://github.com/me/todo/issues/5",
@@ -75,10 +94,13 @@ mkdir -p "$tmp/src/web/.git" "$tmp/src/web-wt"
 printf '[remote "origin"]\n\turl = git@github.com:Acme/Web.git\n' >"$tmp/src/web/.git/config"
 echo "gitdir: $tmp/src/web/.git/worktrees/wt" >"$tmp/src/web-wt/.git"
 
-# Session transcripts: Claude's s1, Codex's t1 and t2.
+# Session transcripts: Claude's s1, Codex's t1 and t2, and threads started in
+# the Codex app (t3) and in its CLI (t4).
 mkdir -p "$home/.claude/projects/-src" "$home/.codex/sessions/2026/10/29"
 rollout() { printf '%s' "$home/.codex/sessions/2026/10/29/rollout-2026-10-29T10-00-00-$1.jsonl"; }
 touch "$home/.claude/projects/-src/s1.jsonl" "$(rollout t1)" "$(rollout t2)"
+echo '{"type":"session_meta","payload":{"id":"t3","originator":"Codex Desktop"}}' >"$(rollout t3)"
+echo '{"type":"session_meta","payload":{"id":"t4","originator":"codex_cli_rs"}}' >"$(rollout t4)"
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -207,6 +229,31 @@ ok "a Codex claim lives while its rollout file exists" json 'map(.session) | ind
 rm -f "$(rollout t2)"
 t claims --json
 ok "a claim lapses when its transcript is gone" json 'map(.session) | index("t2") == null'
+
+echo "# what a click on a claim opens"
+target() { jq -e --arg ref "$1" --arg want "$2" '.[] | select(.ref == $ref) | .open == ($want | if . == "" then null else . end)' >/dev/null 2>&1 <<<"$out"; }
+t CLAUDE_CODE_SESSION_ID=s3 CLAUDE_CODE_HOST_SESSION_ID=local_ab-12 claim 20
+t CODEX_THREAD_ID=t3 claim 21
+t TODO_AGENT_NAME=tmux claim 22
+t claims --json
+ok "a session in the Claude app opens there" target me/todo#20 "claude://code/continue?session=local_ab-12"
+ok "a thread started in the Codex app opens there" target me/todo#21 "codex://threads/t3"
+ok "an agent outside any app opens nothing" target me/todo#22 ""
+printf '%s' "/Applications/Fake Term.app" >"$tmp/ps.app"
+t CLAUDE_CODE_SESSION_ID=s4 "CLAUDE_CODE_HOST_SESSION_ID=local_a&b" claim 23
+t CODEX_THREAD_ID=t4 claim 24
+t TODO_AGENT_NAME=aider TODO_SESSION=y claim 25
+rm -f "$tmp/ps.app"
+t claims --json
+ok "Claude without a valid app session id opens its terminal" target me/todo#23 "/Applications/Fake Term.app"
+ok "Codex in a terminal opens the terminal" target me/todo#24 "/Applications/Fake Term.app"
+ok "another agent opens the app it runs in" target me/todo#25 "/Applications/Fake Term.app"
+printf '%s\n' "me/todo#26${sep}old${sep}o${sep}${sep}$(date +%s)${sep}" >"$claims/old-o"
+t claims --json
+ok "a claim from before click targets still reads, without one" target me/todo#26 ""
+for n in 20 21 22 23 24 25 26; do t release "$n"; done
+t claims --json
+ok "...and they all release" json 'map(.ref | ltrimstr("me/todo#") | tonumber) | all(. < 20)'
 
 echo "# done"
 t "done" acme/web#88

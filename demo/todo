@@ -32,7 +32,7 @@ case "${1:-list}" in
     cat <<JSON
 [
   {"ref":"acme/api#212","agent":"claude","session":"5f0c2a9e-demo","since":$((now - 2900)),"lastActive":$((now - 20)),"active":true},
-  {"ref":"you/todo#14","agent":"codex","session":"019a6b2c-demo","since":$((now - 1500)),"lastActive":$((now - 45)),"active":true},
+  {"ref":"you/todo#14","agent":"codex","session":"019a6b2c-demo","since":$((now - 1500)),"lastActive":$((now - 45)),"active":true,"open":"/System/Applications/Utilities/Terminal.app"},
   {"ref":"acme/web#88","agent":"claude","session":"a81d77f3-demo","since":$((now - 4800)),"lastActive":$((now - 540)),"active":false}
 ]
 JSON

@@ -175,6 +175,43 @@ detect_session() {
   fi
 }
 
+# What a click on the claim in the window opens: the session itself in the
+# Claude or Codex app, else the app (terminal, editor) the agent runs in.
+# Empty for sessions outside any app, such as in tmux or over ssh.
+session_target() {
+  case "$SESSION_AGENT" in
+    claude)
+      # The desktop app's own id for the session (the same pattern it accepts).
+      if [[ "${CLAUDE_CODE_HOST_SESSION_ID:-}" =~ ^local_[A-Za-z0-9-]{1,64}$ ]]; then
+        printf 'claude://code/continue?session=%s' "$CLAUDE_CODE_HOST_SESSION_ID"
+        return
+      fi ;;
+    codex)
+      # Threads started in the Codex app; Codex in a terminal opens the terminal.
+      if [[ "$SESSION_ID" =~ ^[A-Za-z0-9-]+$ ]] && [ -n "$SESSION_LOG" ] &&
+        head -n 1 "$SESSION_LOG" | jq -e '.payload.originator == "Codex Desktop"' >/dev/null 2>&1; then
+        printf 'codex://threads/%s' "$SESSION_ID"
+        return
+      fi ;;
+  esac
+  owning_app
+}
+
+# The outermost .app among this command's parent processes. Outermost, since
+# Claude Code's own binary can sit in a bundle of its own inside the app. A
+# sandbox that hides other processes just leaves the claim without a target.
+owning_app() {
+  { ps -axo pid=,ppid=,comm= 2>/dev/null || true; } | awk -v p="$PPID" '
+    { pid = $1; parent[pid] = $2; sub(/^ *[0-9]+ +[0-9]+ /, ""); comm[pid] = $0 }
+    END {
+      while (p > 1 && n++ < 64) {
+        if (match(comm[p], /\.app\//)) app = substr(comm[p], 1, RSTART + 3)
+        p = parent[p]
+      }
+      printf "%s", app
+    }'
+}
+
 claim_file() {
   printf '%s/%s' "$TODO_CLAIMS" "$(printf '%s-%s' "$SESSION_AGENT" "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')"
 }
@@ -192,13 +229,15 @@ release_ref() {
 
 # Live claims as a JSON array. A claim lapses (and its file goes) when its
 # session's process has exited, its transcript is gone, or nothing happened
-# in the session for TODO_CLAIM_TTL seconds.
+# in the session for TODO_CLAIM_TTL seconds. open is a link or an app path
+# (see session_target), or null.
 claims_json() {
-  local now f ref agent session pid since log last mtime
+  local now f ref agent session pid since log open last mtime
   now="$(date +%s)"
   for f in "$TODO_CLAIMS"/*; do
     [ -f "$f" ] || continue
-    IFS="$SEP" read -r ref agent session pid since log <"$f" || continue
+    # Claims from before open was added have one field less; open stays empty.
+    IFS="$SEP" read -r ref agent session pid since log open <"$f" || continue
     case "$since" in ''|*[!0-9]*) rm -f "$f"; continue ;; esac
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -f "$f"; continue; fi
     last="$since"
@@ -207,10 +246,11 @@ claims_json() {
       if [ "$mtime" -gt "$last" ]; then last="$mtime"; fi
     fi
     if [ $((now - last)) -gt "$TODO_CLAIM_TTL" ]; then rm -f "$f"; continue; fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$ref" "$agent" "$session" "$since" "$last"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ref" "$agent" "$session" "$since" "$last" "$open"
   done | jq -R -s --argjson now "$now" --argjson window "$TODO_ACTIVE_SECS" '
     split("\n") | map(select(length > 0) | split("\t")
-      | {ref: .[0], agent: .[1], session: .[2], since: (.[3] | tonumber), lastActive: (.[4] | tonumber)}
+      | {ref: .[0], agent: .[1], session: .[2], since: (.[3] | tonumber), lastActive: (.[4] | tonumber),
+         open: (if (.[5] // "") == "" then null else .[5] end)}
       | . + {active: ($now - .lastActive <= $window)})
     | sort_by(0 - .lastActive)'
 }
@@ -219,16 +259,17 @@ cmd_claim() {
   parse_ref "${1:-}"
   detect_session
   mkdir -p "$TODO_CLAIMS"
-  local ref file since old old_since
+  local ref file since old old_since target
   ref="$REF_REPO#$REF_NUM"
   file="$(claim_file)"
   since="$(date +%s)"
+  target="$(session_target)"
   # Claiming the same item again keeps its start time.
   if [ -f "$file" ] && IFS="$SEP" read -r old _ _ _ old_since _ <"$file" && [ "$(lower "$old")" = "$(lower "$ref")" ]; then
     since="$old_since"
   fi
-  printf "%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s\n" "$ref" "$SESSION_AGENT" "$SESSION_ID" "$SESSION_PID" "$since" "$SESSION_LOG" \
-    >"$file.tmp"
+  printf "%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s\n" "$ref" "$SESSION_AGENT" "$SESSION_ID" "$SESSION_PID" "$since" \
+    "$SESSION_LOG" "$target" >"$file.tmp"
   mv "$file.tmp" "$file"
   claims_changed
   echo "$SESSION_AGENT is working on $REF_REPO#$REF_NUM; run 'todo release' when you stop"
