@@ -4,6 +4,9 @@
 #
 #   TODO_CLI=$PWD/demo/todo build/Todo
 #   TODO_CLI=$PWD/demo/todo TODO_SNAPSHOT=docs/window.png build/Todo
+#
+# DEMO_WORKER sets what the worker agent is doing: working (the default),
+# paused, idle, stopped, unreachable, or none for no worker at all.
 set -euo pipefail
 
 now="$(date +%s)"
@@ -33,9 +36,23 @@ case "${1:-list}" in
 [
   {"ref":"acme/api#212","agent":"claude","session":"5f0c2a9e-demo","since":$((now - 2900)),"lastActive":$((now - 20)),"active":true},
   {"ref":"you/todo#14","agent":"codex","session":"019a6b2c-demo","since":$((now - 1500)),"lastActive":$((now - 45)),"active":true,"open":"/System/Applications/Utilities/Terminal.app"},
-  {"ref":"acme/web#88","agent":"claude","session":"a81d77f3-demo","since":$((now - 4800)),"lastActive":$((now - 540)),"active":false}
+  {"ref":"acme/web#88","agent":"claude","session":"a81d77f3-demo","since":$((now - 4800)),"lastActive":$((now - 540)),"active":false}$(
+    [ "${DEMO_WORKER:-working}" != working ] ||
+      printf ',\n  {"ref":"acme/web#91","agent":"otto","session":"c3e9d1aa-demo","since":%s,"lastActive":%s,"active":true}' $((now - 720)) $((now - 10)))
 ]
 JSON
+    ;;
+  queue)
+    status="${DEMO_WORKER:-working}" current=null until=null detail='""' host=null
+    case "$status" in
+      none) echo '{"worker":null}'; exit ;;
+      working) current='"acme/web#91"' ;;
+      paused) until=$((now + 5400)) detail='"usage at 82%"' ;;
+      unreachable) host='"devbox"' ;;
+    esac
+    printf '{"worker":"otto","host":%s,"status":"%s","current":%s,"since":%s,"until":%s,"detail":%s,"items":[%s{"ref":"acme/infra#40","since":%s},{"ref":"you/todo#9","since":%s}]}\n' \
+      "$host" "$status" "$current" $((now - 720)) "$until" "$detail" \
+      "$([ "$status" = working ] && printf '{"ref":"acme/web#91","since":%s},' $((now - 3600)))" $((now - 1800)) $((now - 600))
     ;;
   open) open "https://github.com" ;;
   *) echo "demo: todo $* (nothing changes in the demo)" ;;

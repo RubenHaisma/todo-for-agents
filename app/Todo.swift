@@ -80,6 +80,55 @@ struct Claim: Decodable, Hashable {
     }
 }
 
+/// The agent that works through the items you queue for it (`todo work`), as
+/// `todo queue --json` reports it. `worker` is null when none is set up.
+struct WorkerQueue: Decodable, Equatable {
+    struct Entry: Decodable, Equatable {
+        let ref: String
+        let since: TimeInterval
+    }
+
+    let worker: String?
+    /// The machine it runs on, when that isn't this one.
+    let host: String?
+    /// working, paused, idle, stopped or unreachable.
+    let status: String?
+    /// The item it is working on, which stays queued until it is through.
+    let current: String?
+    let until: TimeInterval?
+    let detail: String?
+    var items: [Entry]?
+
+    var title: String { (worker ?? "").capitalized }
+    func contains(_ item: Item) -> Bool { (items ?? []).contains { $0.ref.lowercased() == item.key } }
+    func isCurrent(_ item: Item) -> Bool { current?.lowercased() == item.key }
+    /// In line behind the current item, in the order it takes them.
+    var waiting: [Entry] { (items ?? []).filter { $0.ref.lowercased() != current?.lowercased() } }
+
+    /// One line for the footer, and the colour of its dot.
+    var summary: (text: String, color: Color) {
+        let line = waiting.isEmpty ? "" : " · \(waiting.count) queued"
+        switch status {
+        case "working":
+            let ref = current.map { $0.split(separator: "/").last.map(String.init) ?? $0 } ?? "an item"
+            return ("\(title) is on \(ref)\(line)", .green)
+        case "paused":
+            let when = until.map { Date(timeIntervalSince1970: $0) }
+            let at = when.map { Calendar.current.isDateInToday($0)
+                ? $0.formatted(date: .omitted, time: .shortened)
+                : $0.formatted(.dateTime.weekday(.abbreviated).hour().minute()) }
+            let why = (detail ?? "").isEmpty ? "" : " (\(detail!))"
+            return ("\(title) paused\(at.map { " until \($0)" } ?? "")\(why)\(line)", .orange)
+        case "idle":
+            return ("\(title) is waiting for work\(line)", .secondary)
+        case "unreachable":
+            return ("Can't reach \(host ?? "the worker")\(line)", .orange)
+        default:
+            return ("\(title) isn't running\(line)", waiting.isEmpty ? .secondary : .orange)
+        }
+    }
+}
+
 enum Agent: String {
     case claude, codex
 
@@ -191,9 +240,15 @@ final class Store: ObservableObject {
     @Published private(set) var starting: [String: Agent] = [:]
     /// Agent sessions working on an item, by Item.key.
     @Published private(set) var claims: [String: [Claim]] = [:]
+    /// The worker agent and its queue; nil when no worker is set up.
+    @Published private(set) var queue: WorkerQueue?
+    /// Items being put on or taken off the worker's queue, by ref.
+    @Published private(set) var queueing: Set<String> = []
 
     private var refreshQueued = false
     private var readingClaims = false
+    private var readingQueue = false
+    private var queueStale = false
 
     func refresh(_ reason: String) {
         refreshClaims()
@@ -230,8 +285,10 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Claims are local files, so reading them is cheap enough to poll.
+    /// Claims are local files, so reading them is cheap enough to poll. The
+    /// worker's queue changes with them and is read at the same times.
     func refreshClaims() {
+        refreshQueue()
         if readingClaims { return }
         readingClaims = true
         DispatchQueue.global(qos: .utility).async {
@@ -246,6 +303,49 @@ final class Store: ObservableObject {
                 let byRef = Dictionary(grouping: list) { $0.ref.lowercased() }
                 if byRef != self.claims { self.claims = byRef }
             }
+        }
+    }
+
+    /// Over ssh when the worker runs on another machine (the CLI keeps that
+    /// connection open). A change made while a read is out reads again after it.
+    func refreshQueue() {
+        if readingQueue { queueStale = true; return }
+        readingQueue = true
+        DispatchQueue.global(qos: .utility).async {
+            let r = CLI.run(["queue", "--json"])
+            let decoded = r.status == 0 ? try? JSONDecoder().decode(WorkerQueue.self, from: r.out) : nil
+            DispatchQueue.main.async {
+                self.readingQueue = false
+                if let decoded {
+                    let queue = decoded.worker == nil ? nil : decoded
+                    if queue != self.queue { self.queue = queue }
+                } else {
+                    log("todo queue failed: \(r.err)")
+                }
+                if self.queueStale {
+                    self.queueStale = false
+                    self.refreshQueue()
+                }
+            }
+        }
+    }
+
+    /// Puts the item on the worker's queue, or takes it off (which stops the
+    /// worker if it is on it). The list moves at once; the read that follows
+    /// confirms it.
+    func setQueued(_ item: Item, _ queued: Bool) {
+        guard queue != nil, !queueing.contains(item.ref) else { return }
+        queueing.insert(item.ref)
+        perform([queued ? "queue" : "unqueue", item.ref]) { ok in
+            self.queueing.remove(item.ref)
+            if ok, var queue = self.queue {
+                var items = queue.items ?? []
+                items.removeAll { $0.ref.lowercased() == item.key }
+                if queued { items.append(.init(ref: item.ref, since: Date().timeIntervalSince1970)) }
+                queue.items = items
+                self.queue = queue
+            }
+            self.refreshQueue()
         }
     }
 
@@ -316,7 +416,8 @@ final class Store: ObservableObject {
         let items: [Item]
     }
 
-    /// What agents are working on comes first, the most recently active on top.
+    /// What agents are working on comes first, the most recently active on top,
+    /// then what is queued for the worker, in the order it takes them.
     /// Then the rest, most recent activity first: one flat list or one section
     /// per repo (the repo with the latest activity on top); what you handed to
     /// someone else always comes last.
@@ -324,12 +425,17 @@ final class Store: ObservableObject {
         let newestFirst: (Item, Item) -> Bool = { $0.updatedAt > $1.updatedAt }
         let working = items.filter { lastActive($0) != nil }
             .sorted { lastActive($0)! > lastActive($1)! }
-        let rest = items.filter { lastActive($0) == nil }
+        let idle = items.filter { lastActive($0) == nil }
+        let queued = (queue?.waiting ?? []).compactMap { entry in idle.first { $0.key == entry.ref.lowercased() } }
+        let rest = idle.filter { item in !queued.contains { $0.key == item.key } }
         let own = rest.filter { $0.waiting.isEmpty }.sorted(by: newestFirst)
         let waiting = rest.filter { !$0.waiting.isEmpty }.sorted(by: newestFirst)
         var result: [Group] = []
         if !working.isEmpty {
             result.append(Group(key: "working", title: "IN PROGRESS", color: .green, items: working))
+        }
+        if let queue, !queued.isEmpty {
+            result.append(Group(key: "queued", title: "QUEUED FOR \(queue.title.uppercased())", color: nil, items: queued))
         }
         if byRepo {
             // Grouping keeps each repo's items in the newest-first order of `own`.
@@ -537,10 +643,15 @@ struct PanelView: View {
                         }
                         if !folded {
                             ForEach(group.items) { item in
-                                Row(item: item, showRepo: !byRepo || group.key == "waiting" || group.key == "working",
+                                Row(item: item, showRepo: !byRepo || ["waiting", "working", "queued"].contains(group.key),
                                     claims: store.claims(for: item),
                                     closing: store.closing.contains(item.ref),
                                     starting: store.starting[item.ref],
+                                    spot: store.queue.map { q in
+                                        QueueSpot(worker: q.title, queued: q.contains(item), current: q.isCurrent(item),
+                                                  busy: store.queueing.contains(item.ref))
+                                    },
+                                    onQueue: { store.setQueued(item, $0) },
                                     onDone: { store.done(item) },
                                     // The new session is where you go next.
                                     onStart: { store.start(item, in: $0) { ok in if ok && !pinned { collapsed = true } } },
@@ -574,6 +685,21 @@ struct PanelView: View {
                     .lineLimit(3)
                     .textSelection(.enabled)
             }
+            if let queue = store.queue {
+                let summary = queue.summary
+                HStack(spacing: 6) {
+                    Image(systemName: "circle.fill")
+                        .font(.system(size: 6))
+                        .foregroundStyle(summary.color)
+                    Text(summary.text)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .help("\(queue.title) works through the items you queue for it, one at a time\(queue.host.map { ", on \($0)" } ?? ""). "
+                      + "Right-click an item to queue it.")
+            }
             HStack(spacing: 8) {
                 Image(systemName: "plus").foregroundStyle(.secondary)
                 TextField("Add a to-do", text: $draft)
@@ -601,6 +727,9 @@ struct Row: View {
     let closing: Bool
     /// The agent whose session is being opened for this item, if any.
     let starting: Agent?
+    /// Where the item stands with the worker agent; nil when there is none.
+    let spot: QueueSpot?
+    let onQueue: (Bool) -> Void
     let onDone: () -> Void
     let onStart: (Agent) -> Void
     /// Opens a working agent's session.
@@ -648,6 +777,11 @@ struct Row: View {
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
+                    if let spot, spot.busy {
+                        Text(spot.queued ? "Taking it off \(spot.worker)'s queue…" : "Queuing for \(spot.worker)…")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
                     age
                 }
             }
@@ -677,6 +811,13 @@ struct Row: View {
             if !open.isEmpty { Divider() }
             Button("Do now in Claude Code") { onStart(.claude) }
             Button("Do now in Codex") { onStart(.codex) }
+            if let spot {
+                Button(spot.current ? "Stop \(spot.worker) and take it off the queue"
+                       : spot.queued ? "Take off \(spot.worker)'s queue" : "Queue for \(spot.worker)") {
+                    onQueue(!spot.queued)
+                }
+                .disabled(spot.busy)
+            }
             Divider()
             Button("Open on GitHub") { openOnGitHub() }
             if item.personal { Button("Mark done", action: onDone) }
@@ -743,6 +884,16 @@ struct Row: View {
                 .frame(width: 13)
         }
     }
+}
+
+/// An item as the worker agent sees it, for the row's menu.
+struct QueueSpot {
+    let worker: String
+    let queued: Bool
+    /// The worker is on it now.
+    let current: Bool
+    /// Being put on or taken off the queue.
+    let busy: Bool
 }
 
 /// "● Claude 12m": an agent session on the item, how long it has been on it,

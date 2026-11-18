@@ -29,6 +29,44 @@ TODO_CLAIM_TTL="${TODO_CLAIM_TTL:-43200}"
 # A session counts as active while its transcript changed this recently.
 TODO_ACTIVE_SECS="${TODO_ACTIVE_SECS:-120}"
 
+# The worker (`todo work`): a Claude Code agent that works through the items
+# you queue for it (`todo queue`), one at a time, with nobody watching.
+# TODO_WORKER_NAME names it; empty means there is no worker. With
+# TODO_WORKER_HOST set, the worker runs on that ssh host: `todo queue` goes
+# there, and its claims show up here.
+TODO_WORKER_NAME="${TODO_WORKER_NAME:-}"
+TODO_WORKER_HOST="${TODO_WORKER_HOST:-}"
+# The claude command it runs, and the CLAUDE_CONFIG_DIR of the account it
+# runs as (empty: the command's own).
+TODO_WORKER_CLAUDE="${TODO_WORKER_CLAUDE:-claude}"
+TODO_WORKER_CONFIG_DIR="${TODO_WORKER_CONFIG_DIR:-}"
+TODO_WORKER_MODEL="${TODO_WORKER_MODEL:-}"
+TODO_WORKER_EFFORT="${TODO_WORKER_EFFORT:-}"
+# It starts no item while the plan's 5-hour or weekly usage is at this share
+# or more, and waits for the reset instead.
+TODO_WORKER_MAX_USE="${TODO_WORKER_MAX_USE:-0.8}"
+# An item still running after this long is stopped (2 h).
+TODO_WORKER_TIMEOUT="${TODO_WORKER_TIMEOUT:-7200}"
+# Instructions of your own for the worker, after its built-in rules.
+TODO_WORKER_RULES="${TODO_WORKER_RULES:-}"
+# Commands its agent may never run, on top of the rules it gets. Prefix
+# matches, so they only back the rules up; set the array in the config to change it.
+TODO_WORKER_DENY=(
+  "Bash(gh pr merge:*)" "Bash(gh release create:*)" "Bash(npm publish:*)" "Bash(bun publish:*)"
+  "Bash(git push --force:*)" "Bash(git push -f:*)" "Bash(git push --force-with-lease:*)"
+  "Bash(git push origin main:*)" "Bash(git push origin master:*)"
+  "Bash(kubectl apply:*)" "Bash(kubectl delete:*)" "Bash(kubectl edit:*)" "Bash(kubectl patch:*)"
+  "Bash(kubectl scale:*)" "Bash(kubectl rollout:*)" "Bash(kubectl exec:*)"
+  "Bash(helm install:*)" "Bash(helm upgrade:*)" "Bash(helm uninstall:*)" "Bash(argocd:*)"
+  "Bash(terraform apply:*)" "Bash(terraform destroy:*)"
+)
+# The queue ("ref<TAB>queued at" per line, oldest first) and the worker's
+# state, on the machine the worker runs on.
+TODO_QUEUE="${XDG_STATE_HOME:-$HOME/.local/state}/todo/queue"
+# Each item's git worktree and the agent's output.
+TODO_WORKTREES="${XDG_CACHE_HOME:-$HOME/.cache}/todo/worktrees"
+TODO_WORKER_LOGS="${XDG_STATE_HOME:-$HOME/.local/state}/todo/worker-logs"
+
 TODO_CONFIG="${TODO_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/todo/config}"
 # Local settings (TODO_REPO / TODO_HIDE / TODO_ROOTS / ...) without editing this file.
 if [ -f "$TODO_CONFIG" ]; then
@@ -80,6 +118,12 @@ other repo show up too ("→ name" = created by you, held by someone else;
   todo release [<ref>]              drop this session's claim, or every claim on <ref>
   todo claims [--json]              who works on what; claims lapse when the session
                                     ends or after $((TODO_CLAIM_TTL / 3600)) h without activity
+
+  todo queue [<ref>] [--json]       queue <ref> for your worker agent, or show its queue
+  todo unqueue <ref>                take <ref> off the queue (stops the worker if it is on it)
+  todo work [--watch]               be the worker: work through the queue, oldest first, until
+                                    it is empty or the usage limit is near; --watch stays on
+                                    and waits for new items and for the limit to reset
 
 <ref> is 12 (= $repo#12), owner/repo#12, or an issue URL.
 EOF
@@ -145,6 +189,8 @@ changed() { /usr/bin/notifyutil -p "$TODO_NOTIFY" >/dev/null 2>&1 || true; }
 claims_changed() { /usr/bin/notifyutil -p "$TODO_NOTIFY_CLAIMS" >/dev/null 2>&1 || true; }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# A file's modification time in epoch seconds: GNU stat (Linux), else BSD stat.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 # Whether REF_REPO is the personal to-do repo (GitHub names ignore case).
 is_personal() { [ "$(lower "$REF_REPO")" = "$(lower "$TODO_REPO")" ]; }
 
@@ -152,34 +198,36 @@ is_personal() { [ "$(lower "$REF_REPO")" = "$(lower "$TODO_REPO")" ]; }
 
 first_match() { if [ -e "$1" ]; then printf '%s' "$1"; fi; }
 
-# Sets SESSION_AGENT and SESSION_ID for the agent running this command, plus
-# SESSION_PID (a process that lives as long as the session) and SESSION_LOG
-# (the transcript the agent appends to, which dates its last activity) where
-# the agent has them. TODO_SESSION / TODO_AGENT_NAME name other agents.
+# Sets SESSION_KIND (claude, codex or empty) and SESSION_ID for the agent
+# running this command, plus SESSION_PID (a process that lives as long as the
+# session) and SESSION_LOG (the transcript the agent appends to, which dates
+# its last activity) where the agent has them. SESSION_AGENT is the name the
+# window shows: TODO_AGENT_NAME (the worker sets it), else the kind.
+# TODO_SESSION names sessions of other agents.
 detect_session() {
+  SESSION_KIND=""
   SESSION_PID=""
   SESSION_LOG=""
   if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
-    SESSION_AGENT=claude
+    SESSION_KIND=claude
     SESSION_ID="$CLAUDE_CODE_SESSION_ID"
     SESSION_PID="${CLAUDE_PID:-}"
     SESSION_LOG="$(first_match "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$SESSION_ID".jsonl)"
   elif [ -n "${CODEX_THREAD_ID:-}" ]; then
     # One Codex app process serves every thread, so there is no PID to watch.
-    SESSION_AGENT=codex
+    SESSION_KIND=codex
     SESSION_ID="$CODEX_THREAD_ID"
     SESSION_LOG="$(first_match "${CODEX_HOME:-$HOME/.codex}"/sessions/*/*/*/rollout-*-"$SESSION_ID".jsonl)"
-  else
-    SESSION_AGENT="${TODO_AGENT_NAME:-you}"
-    SESSION_ID="${TODO_SESSION:-$SESSION_AGENT}"
   fi
+  SESSION_AGENT="${TODO_AGENT_NAME:-${SESSION_KIND:-you}}"
+  [ -n "$SESSION_KIND" ] || SESSION_ID="${TODO_SESSION:-$SESSION_AGENT}"
 }
 
 # What a click on the claim in the window opens: the session itself in the
 # Claude or Codex app, else the app (terminal, editor) the agent runs in.
 # Empty for sessions outside any app, such as in tmux or over ssh.
 session_target() {
-  case "$SESSION_AGENT" in
+  case "$SESSION_KIND" in
     claude)
       # The desktop app's own id for the session (the same pattern it accepts).
       if [[ "${CLAUDE_CODE_HOST_SESSION_ID:-}" =~ ^local_[A-Za-z0-9-]{1,64}$ ]]; then
@@ -212,8 +260,18 @@ owning_app() {
     }'
 }
 
+# claim_file [<agent> <session>]: the claim file of a session (default: this one).
 claim_file() {
-  printf '%s/%s' "$TODO_CLAIMS" "$(printf '%s-%s' "$SESSION_AGENT" "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')"
+  printf '%s/%s' "$TODO_CLAIMS" "$(printf '%s-%s' "${1:-$SESSION_AGENT}" "${2:-$SESSION_ID}" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# write_claim <ref> <agent> <session> <pid> <since> <log> <open>
+write_claim() {
+  local file
+  file="$(claim_file "$2" "$3")"
+  mkdir -p "$TODO_CLAIMS"
+  printf "%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s\n" "$@" >"$file.tmp"
+  mv "$file.tmp" "$file"
 }
 
 # Drop every claim on owner/repo#N (GitHub names ignore case).
@@ -227,12 +285,26 @@ release_ref() {
   done
 }
 
-# Live claims as a JSON array. A claim lapses (and its file goes) when its
-# session's process has exited, its transcript is gone, or nothing happened
-# in the session for TODO_CLAIM_TTL seconds. open is a link or an app path
-# (see session_target), or null.
+# Live claims as a JSON array: this machine's, plus the worker host's (with
+# host set) when there is one. A claim on the host it can't reach is left out.
 claims_json() {
-  local now f ref agent session pid since log open last mtime
+  local here there
+  here="$(local_claims_json)"
+  if [ -z "$TODO_WORKER_HOST" ] || ! there="$(remote_poll claims --json 2>/dev/null)" ||
+    ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$there"; then
+    printf '%s\n' "$here"
+    return
+  fi
+  jq -n --argjson here "$here" --argjson there "$there" --arg host "$TODO_WORKER_HOST" '
+    $here + ($there | map(. + {host: $host})) | sort_by(0 - .lastActive)'
+}
+
+# This machine's live claims as a JSON array. A claim lapses (and its file
+# goes) when its session's process has exited, its transcript is gone, or
+# nothing happened in the session for TODO_CLAIM_TTL seconds. open is a link
+# or an app path (see session_target), or null.
+local_claims_json() {
+  local now f ref agent session pid since log open last changed_at
   now="$(date +%s)"
   for f in "$TODO_CLAIMS"/*; do
     [ -f "$f" ] || continue
@@ -242,8 +314,8 @@ claims_json() {
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -f "$f"; continue; fi
     last="$since"
     if [ -n "$log" ]; then
-      if ! mtime="$(stat -f %m "$log" 2>/dev/null)"; then rm -f "$f"; continue; fi
-      if [ "$mtime" -gt "$last" ]; then last="$mtime"; fi
+      if ! changed_at="$(mtime "$log")"; then rm -f "$f"; continue; fi
+      if [ "$changed_at" -gt "$last" ]; then last="$changed_at"; fi
     fi
     if [ $((now - last)) -gt "$TODO_CLAIM_TTL" ]; then rm -f "$f"; continue; fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ref" "$agent" "$session" "$since" "$last" "$open"
@@ -268,9 +340,7 @@ cmd_claim() {
   if [ -f "$file" ] && IFS="$SEP" read -r old _ _ _ old_since _ <"$file" && [ "$(lower "$old")" = "$(lower "$ref")" ]; then
     since="$old_since"
   fi
-  printf "%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s\n" "$ref" "$SESSION_AGENT" "$SESSION_ID" "$SESSION_PID" "$since" \
-    "$SESSION_LOG" "$target" >"$file.tmp"
-  mv "$file.tmp" "$file"
+  write_claim "$ref" "$SESSION_AGENT" "$SESSION_ID" "$SESSION_PID" "$since" "$SESSION_LOG" "$target"
   claims_changed
   echo "$SESSION_AGENT is working on $REF_REPO#$REF_NUM; run 'todo release' when you stop"
 }
@@ -480,7 +550,7 @@ index_checkouts() {
     esac
     slug="${slug%/}"; slug="${slug%.git}"
     printf '%s\t%s\t%s\n' "$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')" \
-      "$(stat -f %m "$g/index" 2>/dev/null || echo 0)" "$d"
+      "$(mtime "$g/index" || echo 0)" "$d"
   done | sort -t "$(printf '\t')" -k1,1 -k2,2nr | awk -F '\t' '!seen[$1]++ { print $1 "\t" $3 }' \
     >"$TODO_CHECKOUTS.tmp"
   mv "$TODO_CHECKOUTS.tmp" "$TODO_CHECKOUTS"
@@ -550,6 +620,498 @@ Start with \`todo claim $REF_REPO#$REF_NUM\` so the to-do window shows you on it
   echo "started $agent on $REF_REPO#$REF_NUM in $WORK_DIR"
 }
 
+# --- The worker: an agent that works through the items you queue -----------
+
+# Sleep in the background, so a signal (systemd stopping the worker) is
+# handled at once rather than after the sleep.
+nap() { sleep "$1" & wait $! || true; }
+safe_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+new_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
+
+# remote <args>: run todo on the worker host. ssh exits 255 when it can't get
+# there; remote_poll then leaves the host alone for a minute, so the window's
+# polls don't each wait for the connect timeout.
+TODO_WORKER_DOWN="${XDG_CACHE_HOME:-$HOME/.cache}/todo/worker-down"
+remote() {
+  local status=0
+  ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$TODO_WORKER_HOST" "todo $(printf '%q ' "$@")" || status=$?
+  if [ "$status" -eq 255 ]; then
+    mkdir -p "$(dirname "$TODO_WORKER_DOWN")"
+    : >"$TODO_WORKER_DOWN"
+  else
+    rm -f "$TODO_WORKER_DOWN"
+  fi
+  return "$status"
+}
+remote_poll() {
+  local down
+  if down="$(mtime "$TODO_WORKER_DOWN")" && [ $(($(date +%s) - down)) -lt 60 ]; then return 255; fi
+  remote "$@"
+}
+
+# The queue file is rewritten under a lock, since the worker and `todo queue`
+# both change it.
+queue_lock() {
+  local tries=0
+  mkdir -p "$(dirname "$TODO_QUEUE")"
+  until mkdir "$TODO_QUEUE.writing" 2>/dev/null; do
+    tries=$((tries + 1))
+    # Left behind by a writer that died: nobody holds a lock for 5 s.
+    if [ "$tries" -ge 50 ]; then rmdir "$TODO_QUEUE.writing" 2>/dev/null || true; tries=0; fi
+    sleep 0.1
+  done
+}
+queue_unlock() { rmdir "$TODO_QUEUE.writing" 2>/dev/null || true; }
+
+queue_has() {
+  [ -f "$TODO_QUEUE" ] && awk -F '\t' -v r="$(lower "$1")" 'tolower($1) == r { f = 1 } END { exit !f }' "$TODO_QUEUE"
+}
+queue_first() { if [ -f "$TODO_QUEUE" ]; then awk -F '\t' 'NF { print $1; exit }' "$TODO_QUEUE"; fi; }
+
+# queue_add <ref>: fails when it is already queued.
+queue_add() {
+  local status=0
+  queue_lock
+  if queue_has "$1"; then status=1; else printf '%s\t%s\n' "$1" "$(date +%s)" >>"$TODO_QUEUE"; fi
+  queue_unlock
+  return "$status"
+}
+
+# queue_remove <ref>: fails when it was not queued.
+queue_remove() {
+  local status=0
+  queue_lock
+  if queue_has "$1"; then
+    awk -F '\t' -v r="$(lower "$1")" 'tolower($1) != r' "$TODO_QUEUE" >"$TODO_QUEUE.tmp"
+    mv "$TODO_QUEUE.tmp" "$TODO_QUEUE"
+  else
+    status=1
+  fi
+  queue_unlock
+  return "$status"
+}
+
+# What the worker is doing, for `todo queue`: worker_state <status> [<current>
+# [<until> [<detail>]]], status being working, paused, idle or stopped.
+worker_state() {
+  mkdir -p "$(dirname "$TODO_QUEUE")"
+  printf "%s$SEP%s$SEP%s$SEP%s$SEP%s$SEP%s\n" "$1" "${2:-}" "${3:-}" "${4:-}" "$$" "$(date +%s)" \
+    >"$TODO_QUEUE.worker.tmp"
+  mv "$TODO_QUEUE.worker.tmp" "$TODO_QUEUE.worker"
+}
+
+# This machine's worker and queue as JSON. A worker whose process is gone is
+# stopped, whatever its state file says.
+local_queue_json() {
+  if [ -z "$TODO_WORKER_NAME" ]; then
+    echo '{"worker":null}'
+    return
+  fi
+  local status=stopped current="" until="" detail="" pid="" since=""
+  if [ -f "$TODO_QUEUE.worker" ]; then
+    IFS="$SEP" read -r status current until detail pid since <"$TODO_QUEUE.worker" || true
+  fi
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then status=stopped; current=""; until=""; fi
+  { if [ -f "$TODO_QUEUE" ]; then cat "$TODO_QUEUE"; fi; } | jq -R -s -c --arg worker "$TODO_WORKER_NAME" \
+    --arg status "$status" --arg current "$current" --arg until "$until" --arg detail "$detail" --arg since "$since" '
+    def num: if . == "" then null else tonumber end;
+    {worker: $worker, host: null, status: $status,
+     current: (if $current == "" then null else $current end),
+     since: ($since | num), until: ($until | num), detail: $detail,
+     items: (split("\n") | map(select(length > 0) | split("\t") | {ref: .[0], since: (.[1] | tonumber)}))}'
+}
+
+# The worker and its queue as JSON, from the worker host when there is one.
+queue_json() {
+  if [ -z "$TODO_WORKER_HOST" ]; then
+    local_queue_json
+    return
+  fi
+  local out
+  if out="$(remote_poll queue --json 2>/dev/null)" && [ -n "$out" ]; then
+    jq -c --arg host "$TODO_WORKER_HOST" '. + {host: $host}' <<<"$out"
+  else
+    jq -n -c --arg worker "$TODO_WORKER_NAME" --arg host "$TODO_WORKER_HOST" '
+      {worker: (if $worker == "" then null else $worker end), host: $host, status: "unreachable",
+       current: null, since: null, until: null, detail: "", items: []}'
+  fi
+}
+
+no_worker() {
+  die "no worker set up: put TODO_WORKER_NAME (and TODO_WORKER_HOST, if it runs on another machine) in $TODO_CONFIG"
+}
+
+cmd_queue() {
+  local ref="" json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      -*) die "unknown option for queue: $1" ;;
+      *) ref="$1"; shift ;;
+    esac
+  done
+  if [ "$json" -eq 1 ]; then
+    queue_json
+    return
+  fi
+  if [ -n "$ref" ]; then
+    parse_ref "$ref"
+    if [ -n "$TODO_WORKER_HOST" ]; then
+      remote queue "$REF_REPO#$REF_NUM" || die "couldn't queue it on $TODO_WORKER_HOST"
+      claims_changed
+      return
+    fi
+    [ -n "$TODO_WORKER_NAME" ] || no_worker
+    local info
+    info="$(gh issue view "$REF_NUM" -R "$REF_REPO" --json state,title)" || die "can't read $REF_REPO#$REF_NUM"
+    [ "$(jq -r .state <<<"$info")" = OPEN ] || die "$REF_REPO#$REF_NUM is closed"
+    if queue_add "$REF_REPO#$REF_NUM"; then
+      claims_changed
+      echo "queued $REF_REPO#$REF_NUM for $TODO_WORKER_NAME: $(jq -r .title <<<"$info")"
+    else
+      echo "$REF_REPO#$REF_NUM is already in $TODO_WORKER_NAME's queue"
+    fi
+    return
+  fi
+  queue_json | jq -r --argjson now "$(date +%s)" '
+    def at: strflocaltime("%a %H:%M");
+    if .worker == null then "no worker set up (TODO_WORKER_NAME)" else
+      "\(.worker)\(if .host then " on \(.host)" else "" end): " + (
+        if .status == "working" then "working on \(.current) for \((($now - .since) / 60) | floor) min"
+        elif .status == "paused" then "paused until \(.until | at)\(if .detail != "" then " (\(.detail))" else "" end)"
+        elif .status == "idle" then "waiting for work"
+        elif .status == "unreachable" then "can'"'"'t reach \(.host)"
+        else "not running (start it with: todo work --watch)" end),
+      (if (.items | length) == 0 then "  nothing queued"
+       else .items[] | "  \(.ref)  queued \(.since | at)" end)
+    end'
+}
+
+cmd_unqueue() {
+  parse_ref "${1:-}"
+  if [ -n "$TODO_WORKER_HOST" ]; then
+    remote unqueue "$REF_REPO#$REF_NUM" || die "couldn't reach $TODO_WORKER_HOST"
+    claims_changed
+    return
+  fi
+  [ -n "$TODO_WORKER_NAME" ] || no_worker
+  if queue_remove "$REF_REPO#$REF_NUM"; then
+    claims_changed
+    echo "took $REF_REPO#$REF_NUM off $TODO_WORKER_NAME's queue (it stops if it was working on it)"
+  else
+    echo "$REF_REPO#$REF_NUM is not in $TODO_WORKER_NAME's queue"
+  fi
+}
+
+# Runs the worker's claude in place of this shell, as the worker's account,
+# with nothing of a Claude or Codex session this command may run in.
+exec_claude() {
+  local v
+  for v in $(compgen -e); do
+    case "$v" in CLAUDE*|ANTHROPIC*|CODEX*) unset "$v" ;; esac
+  done
+  if [ -n "$TODO_WORKER_CONFIG_DIR" ]; then export CLAUDE_CONFIG_DIR="$TODO_WORKER_CONFIG_DIR"; fi
+  export TODO_AGENT_NAME="$TODO_WORKER_NAME"
+  exec "$TODO_WORKER_CLAUDE" "$@"
+}
+
+# Checks the plan's usage with a one-line Haiku call, whose stream reports the
+# 5-hour and weekly windows. Fails, setting USE (percent) and PAUSE_UNTIL,
+# when either is at TODO_WORKER_MAX_USE or more. No report: go ahead.
+usage_ok() {
+  local out verdict
+  out="$( (cd / && exec_claude -p "Reply with ok." --model haiku --output-format stream-json --verbose \
+    --strict-mcp-config --no-session-persistence) </dev/null 2>/dev/null)" || true
+  verdict="$(jq -R -s -r --argjson max "$TODO_WORKER_MAX_USE" '
+    [split("\n")[] | fromjson? | select(.type == "rate_limit_event") | .rate_limit_info] | last
+    | if . == null then "ok" else
+        ([.unifiedWindows // {} | to_entries[].value | {u: (.utilization // 0), r: (.resetsAt // 0)}]
+          + (if .status == "rejected" then [{u: 1, r: (.resetsAt // 0)}] else [] end)
+          | max_by(.u) // {u: 0, r: 0}) as $w
+        | if $w.u >= $max then "\($w.u * 100 | floor) \($w.r)" else "ok" end
+      end' <<<"$out")" || verdict=ok
+  [ "$verdict" != ok ] || return 0
+  USE="${verdict% *}"
+  PAUSE_UNTIL="${verdict#* }"
+  return 1
+}
+
+worker_rules() {
+  cat <<EOF
+You are $TODO_WORKER_NAME, working unattended through a to-do queue: nobody watches this session, answers questions or approves anything until you finish.
+
+- Work only on $1. The queue does the to-do bookkeeping: don't run \`todo claim\`, \`todo release\`, \`todo done\` or \`todo reopen\`, and don't comment on the issue; your final message is posted on it as a note.
+- Changes to code go on the branch $2, never on a default branch: commit, push the branch, and open a pull request whose description says \`Fixes $1\`. Never merge it.
+- Never merge, deploy, release, publish, send email or chat messages, pay, or change live systems, and never force-push. When the item needs one of those, prepare it and say what is left to do.
+- When you need a decision, access or a credential, stop and say exactly what is needed.
+- An item that needs no code change ends with your findings or a draft in the final message.
+- End with a short final message (at most 15 lines): what you did, the link to the pull request or branch, and what is left for a person. It is posted as it is.
+EOF
+  if [ -n "$TODO_WORKER_RULES" ]; then printf '%s\n' "$TODO_WORKER_RULES"; fi
+}
+
+# worktree_for <checkout> <worktree> <branch>: a worktree of the checkout on
+# the branch, made from the remote's default branch, or the one an earlier
+# run left. Sets WT_BASE, and WT_REUSED=1 when there was earlier work.
+worktree_for() {
+  local repo="$1" wt="$2" branch="$3" f
+  git -C "$repo" fetch --quiet origin 2>/dev/null || true
+  WT_BASE="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -z "$WT_BASE" ]; then
+    for WT_BASE in origin/main origin/master HEAD; do
+      if git -C "$repo" rev-parse --verify --quiet "$WT_BASE^{commit}" >/dev/null; then break; fi
+    done
+  fi
+  WT_REUSED=0
+  if git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+    WT_REUSED=1
+    return 0
+  fi
+  git -C "$repo" worktree prune
+  mkdir -p "$(dirname "$wt")"
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    WT_REUSED=1
+    git -C "$repo" worktree add --quiet "$wt" "$branch" || return 1
+  else
+    git -C "$repo" worktree add --quiet --no-track -b "$branch" "$wt" "$WT_BASE" || return 1
+  fi
+  # The checkout's own .env files, which git ignores and so leaves behind.
+  for f in "$repo"/.env*; do
+    if [ -f "$f" ] && [ ! -e "$wt/${f##*/}" ] && git -C "$repo" check-ignore -q "$f"; then ln -s "$f" "$wt/"; fi
+  done
+}
+
+# Tidy a worktree once a run ends: one without work goes with its branch; one
+# whose work is all pushed goes too, but its branch stays, so a later run on
+# the item continues from it. Unpushed or uncommitted work stays put.
+tidy_worktree() {
+  local repo="$1" wt="$2" branch="$3"
+  [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ] || return 0
+  if [ "$(git -C "$wt" rev-list --count "$WT_BASE..HEAD" 2>/dev/null || echo 1)" = 0 ]; then
+    git -C "$repo" worktree remove "$wt" 2>/dev/null && git -C "$repo" branch -D --quiet "$branch" 2>/dev/null || true
+  elif [ -n "$(git -C "$wt" branch -r --contains HEAD 2>/dev/null)" ]; then
+    git -C "$repo" worktree remove "$wt" 2>/dev/null || true
+  fi
+}
+
+stop_agent() {
+  [ -n "${AGENT_PID:-}" ] || return 0
+  pkill -TERM -P "$AGENT_PID" 2>/dev/null || true
+  kill -TERM "$AGENT_PID" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$AGENT_PID" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL "$AGENT_PID" 2>/dev/null || true
+}
+
+# Posts the worker's note on the item; a failure only shows in the log.
+worker_note() {
+  gh issue comment "$REF_NUM" -R "$REF_REPO" --body "$1" >/dev/null ||
+    echo "todo work: couldn't note on $REF_REPO#$REF_NUM" >&2
+}
+
+# run_item <ref>: one item, start to finish. Returns 0 when the item is done
+# with (it leaves the queue), 3 to keep it and wait until PAUSE_UNTIL, for
+# the reason in PAUSE_WHY.
+run_item() {
+  local ref="$1" info title dir branch wt="" where="" sid log started status=0 outcome="" result
+  parse_ref "$ref"
+  if ! info="$(gh issue view "$REF_NUM" -R "$REF_REPO" --json state,title 2>&1)"; then
+    case "$info" in
+      *"Could not resolve"*) echo "todo work: dropped $ref: no such issue" >&2; return 0 ;;
+    esac
+    echo "todo work: can't read $ref, trying again in 10 min: $info" >&2
+    PAUSE_UNTIL=$(($(date +%s) + 600))
+    PAUSE_WHY="can't read $ref"
+    return 3
+  fi
+  title="$(jq -r .title <<<"$info")"
+  if [ "$(jq -r .state <<<"$info")" != OPEN ]; then
+    echo "todo work: dropped $ref: it is closed" >&2
+    return 0
+  fi
+
+  mkdir -p "$TODO_WORKER_LOGS"
+  resolve_dir 2>/dev/null
+  dir="$WORK_DIR"
+  branch="$TODO_WORKER_NAME/$REF_NUM"
+  if ! is_personal && [ "$dir" != "$TODO_DIR" ] && git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    wt="$TODO_WORKTREES/$(safe_name "$REF_REPO-$REF_NUM")"
+    if ! worktree_for "$dir" "$wt" "$branch" 2>"$TODO_WORKER_LOGS/git.err"; then
+      worker_note "**$TODO_WORKER_NAME** (todo worker) couldn't start: no git worktree of $dir on $branch: $(tail -n 3 "$TODO_WORKER_LOGS/git.err")"
+      return 0
+    fi
+    where="You are in a git worktree of $REF_REPO on the branch $branch, made from $WT_BASE for this item."
+    [ "$WT_REUSED" -eq 0 ] || where="$where It holds earlier work on this item: continue from there."
+    dir="$wt"
+  else
+    where="This folder is not a checkout of the repo the work belongs to; don't change the checkouts in it. For code changes, make a git worktree (or clone) under $TODO_WORKTREES on a branch named $branch."
+  fi
+
+  sid="$(new_uuid)"
+  log="$TODO_WORKER_LOGS/$(date +%Y%m%d-%H%M%S)-$(safe_name "$REF_REPO-$REF_NUM").jsonl"
+  local args=(-p "Work on $ref: $title
+https://github.com/$REF_REPO/issues/$REF_NUM
+
+Read the issue and its comments first: \`todo show $ref\`. $where"
+    --session-id "$sid" --output-format stream-json --verbose
+    --permission-mode auto --permission-prompts none --strict-mcp-config
+    --append-system-prompt "$(worker_rules "$ref" "$branch")")
+  [ -z "$TODO_WORKER_MODEL" ] || args+=(--model "$TODO_WORKER_MODEL")
+  [ -z "$TODO_WORKER_EFFORT" ] || args+=(--effort "$TODO_WORKER_EFFORT")
+  # Variadic, so it goes last.
+  [ ${#TODO_WORKER_DENY[@]} -eq 0 ] || args+=(--disallowedTools "${TODO_WORKER_DENY[@]}")
+
+  started="$(date +%s)"
+  (cd "$dir" && exec_claude "${args[@]}") </dev/null >"$log" 2>"$log.err" &
+  AGENT_PID=$!
+  write_claim "$ref" "$TODO_WORKER_NAME" "$sid" "$AGENT_PID" "$started" "$log" ""
+  worker_state working "$ref"
+  echo "todo work: working on $ref (log: $log)"
+
+  # Wait for the agent; stop it after the timeout, or once it is unqueued.
+  local ticks=0
+  while kill -0 "$AGENT_PID" 2>/dev/null; do
+    nap 1
+    ticks=$((ticks + 1))
+    if [ $(($(date +%s) - started)) -ge "$TODO_WORKER_TIMEOUT" ]; then outcome=timeout; stop_agent; break; fi
+    if [ $((ticks % 5)) -eq 0 ] && ! queue_has "$ref"; then outcome=cancelled; stop_agent; break; fi
+  done
+  wait "$AGENT_PID" 2>/dev/null || status=$?
+  AGENT_PID=""
+  rm -f "$(claim_file "$TODO_WORKER_NAME" "$sid")"
+
+  # What the run left in its stream: the result, and whether it hit the limit.
+  result="$(jq -R -s -c '
+    [split("\n")[] | fromjson?] as $e
+    | ([$e[] | select(.type == "result")] | last) as $r
+    | ([$e[] | select(.type == "rate_limit_event") | .rate_limit_info] | last) as $l
+    | {text: ($r.result // "" | tostring), error: (if $r == null then true else ($r.is_error // false) end),
+       turns: ($r.num_turns // 0),
+       limited: ((($l.status // "") == "rejected")
+         or (($r.is_error // false) and ((($r.api_error_status // 0) == 429)
+           or (($r.result // "" | tostring) | test("limit reached|usage limit|rate.limit|hit your (usage )?limit"; "i"))))),
+       resets: ([($l.resetsAt // 0), ($l.unifiedWindows // {} | to_entries[].value
+                 | select(.status == "rejected") | .resetsAt // 0)] | max)}' "$log" 2>/dev/null)" ||
+    result='{"text":"","error":true,"turns":0,"limited":false,"resets":0}'
+
+  local minutes text turns header
+  minutes=$((($(date +%s) - started + 59) / 60))
+  text="$(jq -r .text <<<"$result")"
+  turns="$(jq -r .turns <<<"$result")"
+  header="**$TODO_WORKER_NAME** (todo worker) · $minutes min · $turns turns"
+  if [ -z "$outcome" ]; then
+    if [ "$(jq -r .limited <<<"$result")" = true ]; then
+      outcome=limited
+    elif [ "$(jq -r .error <<<"$result")" = true ]; then
+      outcome=error
+    else
+      outcome="done"
+    fi
+  fi
+  [ -z "$wt" ] || [ "$outcome" = limited ] || tidy_worktree "$WORK_DIR" "$wt" "$branch"
+  local left=""
+  [ -z "$wt" ] || ! git -C "$WORK_DIR" show-ref --verify --quiet "refs/heads/$branch" || left=" Work so far is on the branch $branch."
+  case "$outcome" in
+    done)
+      worker_note "$header
+
+$text" ;;
+    limited)
+      PAUSE_UNTIL="$(jq -r .resets <<<"$result")"
+      [ "$PAUSE_UNTIL" -gt "$(date +%s)" ] || PAUSE_UNTIL=$(($(date +%s) + 3600))
+      PAUSE_WHY="usage limit"
+      echo "todo work: $ref hit the usage limit; it stays queued" >&2
+      return 3 ;;
+    timeout)
+      worker_note "$header
+
+Ran out of time: stopped after $minutes min without finishing.$left" ;;
+    cancelled)
+      echo "todo work: stopped $ref: it was taken off the queue.$left" >&2 ;;
+    error)
+      # A run that never got going (not logged in, claude missing) is the
+      # worker's problem, not the item's: keep it and try again later.
+      if [ "$turns" -eq 0 ]; then
+        echo "todo work: $ref didn't start (exit $status): ${text:-$(tail -n 3 "$log.err")}" >&2
+        PAUSE_UNTIL=$(($(date +%s) + 600))
+        PAUSE_WHY="the agent didn't start"
+        return 3
+      fi
+      worker_note "$header
+
+Stopped with an error: ${text:-$(tail -n 3 "$log.err")}$left" ;;
+  esac
+  echo "todo work: $outcome $ref"
+  return 0
+}
+
+worker_exit() {
+  stop_agent
+  rm -f "$TODO_CLAIMS/$(safe_name "$TODO_WORKER_NAME")-"* 2>/dev/null || true
+  worker_state stopped
+  rm -rf "$TODO_QUEUE.lock"
+}
+
+cmd_work() {
+  local watch=0
+  case "${1:-}" in
+    --watch) watch=1 ;;
+    '') ;;
+    *) die "usage: todo work [--watch]" ;;
+  esac
+  [ -n "$TODO_WORKER_NAME" ] || no_worker
+  [ -z "$TODO_WORKER_HOST" ] || die "$TODO_WORKER_NAME works on $TODO_WORKER_HOST: run todo work there"
+  command -v "$TODO_WORKER_CLAUDE" >/dev/null || die "no command $TODO_WORKER_CLAUDE (TODO_WORKER_CLAUDE)"
+
+  # One worker per queue.
+  mkdir -p "$(dirname "$TODO_QUEUE")"
+  local pid
+  if ! mkdir "$TODO_QUEUE.lock" 2>/dev/null; then
+    pid="$(cat "$TODO_QUEUE.lock/pid" 2>/dev/null || true)"
+    # The pid may be stale and reused (after a reboot): only a worker counts.
+    if [ -n "$pid" ] && ps -o args= -p "$pid" 2>/dev/null | grep -q 'todo.* work'; then
+      die "$TODO_WORKER_NAME is already working (pid $pid)"
+    fi
+    rm -rf "$TODO_QUEUE.lock"
+    mkdir "$TODO_QUEUE.lock" || die "can't lock $TODO_QUEUE.lock"
+  fi
+  echo "$$" >"$TODO_QUEUE.lock/pid"
+  AGENT_PID=""
+  trap worker_exit EXIT
+  trap 'exit 130' INT TERM HUP
+
+  local ref status
+  while :; do
+    ref="$(queue_first)"
+    if [ -z "$ref" ]; then
+      if [ "$watch" -eq 0 ]; then echo "todo work: the queue is empty"; return 0; fi
+      worker_state idle
+      nap 15
+      continue
+    fi
+    if ! usage_ok; then
+      worker_state paused "" "$PAUSE_UNTIL" "usage at $USE%"
+      if [ "$watch" -eq 0 ]; then
+        echo "todo work: usage is at $USE%; it resets $(date -d "@$PAUSE_UNTIL" 2>/dev/null || date -r "$PAUSE_UNTIL")"
+        return 75
+      fi
+      nap $((PAUSE_UNTIL > $(date +%s) ? PAUSE_UNTIL - $(date +%s) + 60 : 900))
+      continue
+    fi
+    status=0
+    run_item "$ref" || status=$?
+    if [ "$status" -eq 0 ]; then
+      queue_remove "$ref" || true
+      continue
+    fi
+    worker_state paused "$ref" "$PAUSE_UNTIL" "$PAUSE_WHY"
+    [ "$watch" -eq 1 ] || return 75
+    nap $((PAUSE_UNTIL > $(date +%s) ? PAUSE_UNTIL - $(date +%s) + 60 : 600))
+  done
+}
+
 sub="${1:-list}"
 [ $# -eq 0 ] || shift
 case "$sub" in
@@ -571,6 +1133,9 @@ case "$sub" in
   claim|working) cmd_claim "$@" ;;
   release|unclaim) cmd_release "$@" ;;
   claims) cmd_claims "$@" ;;
+  queue) cmd_queue "$@" ;;
+  unqueue|dequeue) cmd_unqueue "$@" ;;
+  work) cmd_work "$@" ;;
   rules) agent_rules ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;

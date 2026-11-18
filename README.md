@@ -87,6 +87,8 @@ todo start 12 --codex         # same, in Codex
 todo claim acme/web#88        # this agent session works on it
 todo release                  # ...and is done with it
 todo claims                   # who works on what
+todo queue acme/web#88        # hand it to your worker agent
+todo queue                    # what the worker is doing and what is next
 ```
 
 A ref is `12` (an issue in your to-do repo), `owner/repo#12`, or an issue URL.
@@ -127,6 +129,47 @@ window:
 The window only follows `claude://code/continue` and `codex://threads` links
 or opens an installed `.app`, whatever a claim file says.
 
+## A worker agent
+
+Instead of opening a session yourself, you can queue an item for a worker: an
+agent with its own Claude account that works through the queue, one item at a
+time and oldest first, while nobody watches.
+
+```bash
+todo queue acme/web#88        # queue it (refused when the issue is closed)
+todo unqueue acme/web#88      # take it off again; stops the worker if it is on it
+todo work --watch             # be the worker: keep working, wait for new items
+```
+
+For each item the worker:
+
+1. checks the account's usage. At `TODO_WORKER_MAX_USE` of the 5-hour or weekly
+   limit it starts nothing and waits for the reset, so it leaves room for the
+   people who share the account;
+2. makes a git worktree of your clone of the item's repo, on the branch
+   `<worker>/<number>` from the default branch, with the clone's `.env` files
+   linked in. Personal items run in `TODO_DIR`;
+3. runs `claude -p` there in auto permission mode, as the worker's account,
+   with the issue as the prompt and rules of its own: end in a pull request
+   that says `Fixes <ref>`, a draft or findings; never merge, deploy, publish,
+   send messages, pay or change live systems; stop and say what is needed when
+   it needs a decision or a credential. `TODO_WORKER_DENY` blocks the commands
+   that would do those things, as a backstop;
+4. posts the final message on the issue as a note and takes the item off the
+   queue. An item that ran out of usage or did not start stays queued; one
+   that ran past `TODO_WORKER_TIMEOUT` is stopped and noted.
+
+The worker claims what it works on, so the window shows it under In progress.
+Queued items get a section of their own, in the order the worker takes them,
+and the footer says what the worker is doing. Right-click an item to queue it
+or take it off.
+
+The worker can run on another machine, such as a dev box that is always on.
+Set it up there with its own config, and on your Mac set `TODO_WORKER_HOST`:
+`todo queue`, `unqueue` and `claims` then go over ssh (BatchMode, so the key
+must load without a prompt). Keep `todo work --watch` running there, for
+instance as a systemd user service.
+
 ## The window
 
 <img src="docs/pill.png" width="90" alt="The folded window: a checklist icon, the number 7 and three coloured dots">
@@ -166,6 +209,16 @@ TODO_HIDE="old-org/old-repo"               # repos to leave off the list
 TODO_ROOTS="$HOME/Developer $HOME/code"    # where your clones live
 TODO_DIR="$HOME"                           # where personal items open
 TODO_AGENT="claude"                        # or codex, for todo start
+
+# The worker agent (see "A worker agent"); leave TODO_WORKER_NAME empty for none.
+TODO_WORKER_NAME="otto"                    # who it is: its claims, branches and notes
+TODO_WORKER_HOST=""                        # ssh host it runs on; empty: this machine
+TODO_WORKER_CONFIG_DIR="$HOME/.claude-otto" # its Claude account (CLAUDE_CONFIG_DIR)
+TODO_WORKER_MODEL=""                       # --model; empty: the account's default
+TODO_WORKER_EFFORT=""                      # --effort
+TODO_WORKER_MAX_USE="0.8"                  # wait for the reset from this share of a limit
+TODO_WORKER_TIMEOUT="7200"                 # stop an item after this many seconds
+TODO_WORKER_RULES=""                       # your own rules, after its built-in ones
 ```
 
 ## Try the window without GitHub
@@ -181,6 +234,10 @@ TODO_CLI=$PWD/demo/todo build/Todo
 
 Set `TODO_SNAPSHOT=window.png` as well to save a picture of the window once
 the list has loaded.
+
+The demo includes a worker agent called Otto. `DEMO_WORKER` sets what it is
+doing: `working` (the default), `paused`, `idle`, `stopped`, `unreachable`, or
+`none` for no worker at all.
 
 ## Tests
 
