@@ -26,6 +26,8 @@ case "$1 $2" in
   "issue list") cat "$dir/personal.json" ;;
   "search issues")
     case " $* " in
+      # The build bot's items; search.fail makes GitHub unreadable.
+      *" --label "*) [ ! -e "$dir/search.fail" ] || exit 1; cat "$dir/factory.json" ;;
       *" --author "*) cat "$dir/authored.json" ;;
       *) cat "$dir/assigned.json" ;;
     esac ;;
@@ -39,6 +41,15 @@ case "$1 $2" in
           exit 1
         fi
         printf '{"state":"%s","title":"Fix the thing"}\n' "$state" ;;
+      # labels.<number> holds the issue's labels, one per line.
+      *" --json state,title,url,labels "*|*" --json labels "*)
+        repo=""; prev=""
+        for a in "$@"; do if [ "$prev" = -R ]; then repo="$a"; fi; prev="$a"; done
+        touch "$dir/labels.$3"
+        labels="$(jq -R -s -c 'split("\n") | map(select(length > 0) | {name: .})' "$dir/labels.$3")"
+        jq -n -c --arg state "$(cat "$dir/state.$3" 2>/dev/null || echo OPEN)" \
+          --arg url "https://github.com/$repo/issues/$3" --argjson labels "$labels" \
+          '{state: $state, title: "Fix the thing", url: $url, labels: $labels}' ;;
       *" --json "*) echo "Fix the thing" ;;
       # Like gh without a terminal: --comments prints the comments only.
       *" --comments "*) printf 'author:\talex\n--\nOn it\n--\n' ;;
@@ -52,7 +63,28 @@ case "$1 $2" in
       if [ "$1" = --body ]; then printf '%s\n' "$2" >>"$dir/note.$n"; fi
       shift
     done ;;
-  "issue close"|"issue reopen") ;;
+  "issue close"|"issue reopen"|"project item-add") ;;
+  "issue edit")
+    n="$3"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --add-label) printf '%s\n' "$2" >>"$dir/labels.$n" ;;
+        --remove-label) { grep -vxF -- "$2" "$dir/labels.$n" || true; } >"$dir/labels.tmp"; mv "$dir/labels.tmp" "$dir/labels.$n" ;;
+      esac
+      shift
+    done ;;
+  # The repos listed in labelled have the build bot's ready label; api.fail
+  # and graphql.fail make GitHub unreadable.
+  "api repos/"*)
+    if [ -e "$dir/api.fail" ]; then echo "error connecting to api.github.com" >&2; exit 1; fi
+    r="${2#repos/}"
+    if grep -qixF -- "${r%/labels/*}" "$dir/labelled" 2>/dev/null; then exit 0; fi
+    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  "api graphql")
+    [ ! -e "$dir/graphql.fail" ] || exit 1
+    org=""
+    for a in "$@"; do case "$a" in org=*) org="${a#org=}" ;; esac; done
+    { grep -i "^$org/" "$dir/labelled" 2>/dev/null || true; } | tr '[:upper:]' '[:lower:]' ;;
   *) echo "gh stand-in: unexpected call: gh $*" >&2; exit 1 ;;
 esac
 EOF
@@ -617,6 +649,106 @@ ok "...and is left alone for a minute after" [ "$(wc -l <"$tmp/ssh.log")" -eq "$
 ok "...while local claims still show" json 'type == "array"'
 m SSH_DOWN=1 queue 5
 ok "queueing on a machine out of reach fails" fails_with "couldn't queue it on devbox"
+
+echo "# a build bot"
+# acme's bot works in acme/web, the one repo with its ready label.
+printf 'Acme/Web\n' >"$tmp/labelled"
+f() { w TODO_FACTORY="acme:7:acme-bot" TODO_QUEUE_OWNERS="Acme" "$@"; }
+# first <a> <b>: gh was asked a before b.
+first() {
+  local a b
+  a="$(grep -nF -- "$1" "$tmp/gh.log" | head -n 1 | cut -d: -f1)"
+  b="$(grep -nF -- "$2" "$tmp/gh.log" | head -n 1 | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
+}
+lacks() { ! has "$1"; }
+f queue other/repo#1
+ok "queue refuses a repo whose owner TODO_QUEUE_OWNERS leaves out" fails_with "won't queue other/repo#1: the queue takes repos of Acme only"
+ok "...without asking GitHub" not_logged "other/repo"
+w TODO_QUEUE_OWNERS="Acme" queue --json
+ok "...and queue --json says which owners it takes" json '.owners == ["acme"] and .factory == null'
+f queue acme/web#70
+ok "an item in a repo with the ready label goes to the bot" says "handed acme/web#70 to the factory (acme-bot): Fix the thing"
+ok "...after asking GitHub whether the repo has the label" logged "api repos/acme/web/labels/factory%3Aready --silent"
+ok "...onto the org's board" logged "project item-add 7 --owner acme --url https://github.com/acme/web/issues/70"
+ok "...assigned to the bot" logged "issue edit 70 -R acme/web --add-assignee acme-bot"
+ok "...and labelled last, which starts the job" first "--add-assignee acme-bot" "--add-label factory:ready"
+ok "...after the board" first "project item-add 7" "--add-assignee acme-bot"
+w queue --json
+ok "...not to the worker" json '(.items | map(.ref) | index("acme/web#70")) == null'
+f queue acme/web#70
+ok "an item the bot has already stays as it is" says "acme/web#70 is already with the factory"
+ok "...labelled once" [ "$(grep -c -- "issue edit 70 -R acme/web --add-label" "$tmp/gh.log")" -eq 1 ]
+echo "factory:ready" >"$tmp/labels.74"
+f queue acme/web#74
+ok "an item labelled by hand also gets the board and the bot, or the bot ignores it" logged "issue edit 74 -R acme/web --add-assignee acme-bot"
+ok "...and says it is with the bot" says "acme/web#74 is already with the factory"
+echo CLOSED >"$tmp/state.71"
+f queue acme/web#71
+ok "a closed item isn't handed over" fails_with "acme/web#71 is closed"
+ok "...and nothing changes on GitHub" not_logged "71 -R acme/web --add"
+ok "...on the board either" not_logged "issues/71"
+f queue acme/api#72
+ok "an item in a repo without the label goes to the worker" says "queued acme/api#72 for otto"
+f unqueue acme/web#70
+ok "unqueue takes the ready label off, which stops the bot" says "took acme/web#70 back from the factory"
+ok "...on GitHub" logged "issue edit 70 -R acme/web --remove-label factory:ready"
+f unqueue acme/api#72
+ok "unqueue of an item the bot doesn't have goes to the worker" says "took acme/api#72 off otto's queue"
+w TODO_FACTORY="acme:seven:acme-bot" queue acme/web#73
+ok "a TODO_FACTORY entry without a project number is refused" fails_with "TODO_FACTORY entry 'acme:seven:acme-bot' is not org:project-number:bot-login"
+w TODO_FACTORY="acme:7" queue acme/web#73
+ok "...and one without a bot" fails_with "TODO_FACTORY entry 'acme:7' is not org:project-number:bot-login"
+touch "$tmp/api.fail"
+f queue acme/web#73
+ok "an item whose repo GitHub can't check goes nowhere" fails_with "can't tell whether acme/web has the factory:ready label"
+ok "...not even to the worker" not_logged "issue view 73"
+rm "$tmp/api.fail"
+f queue --json
+ok "queue --json lists the repos that go to the bot, in lower case" json '.owners == ["acme"] and .factory == {name: "the factory", repos: ["acme/web"]} and .worker == "otto"'
+f queue --json
+ok "...reading them from GitHub once an hour at most" [ "$(grep -c "^api graphql" "$tmp/gh.log")" -eq 1 ]
+touch -t 202601010000 "$home/.cache/todo/factory-repos"
+touch "$tmp/graphql.fail"
+f queue --json
+ok "...keeping the last list when GitHub can't be read" json '.factory.repos == ["acme/web"]'
+rm "$tmp/graphql.fail"
+f TODO_FACTORY_NAME="Bob" queue --json
+ok "...under the bot's name" json '.factory.name == "Bob"'
+w TODO_FACTORY="acme:7:acme-bot other:2:o-bot" queue --json
+ok "...and reading them again when the bots change" json '.factory.repos == ["acme/web"]'
+ok "...once per org" [ "$(grep -c "^api graphql" "$tmp/gh.log")" -eq 4 ]
+cat >"$tmp/factory.json" <<'EOF'
+[{"repository": {"nameWithOwner": "acme/web"}, "number": 70, "title": "Fix the thing",
+  "labels": [{"name": "factory:ready"}, {"name": "factory:running"}]},
+ {"repository": {"nameWithOwner": "acme/api"}, "number": 3, "title": "Another",
+  "labels": [{"name": "factory:ready"}, {"name": "bug"}]}]
+EOF
+f queue
+ok "queue shows what the bot has" line '^the factory in acme: 2 item\(s\)$'
+ok "...with how far it is" line '^  acme/web#70  running  Fix the thing$'
+ok "...or that it waits" line '^  acme/api#3  waiting  Another$'
+ok "...and the worker too" line '^otto: '
+t TODO_FACTORY="acme:7:acme-bot" queue
+ok "without a worker, queue shows the bot" says "the factory in acme: 2 item(s)"
+ok "...only" lacks "no worker"
+touch "$tmp/search.fail"
+f queue
+ok "...or that it can't read it" line "^the factory in acme: can't read it$"
+rm "$tmp/search.fail"
+cp "$tmp/authored.json" "$tmp/authored.bak"
+jq '(.[] | select(.number == 9) | .labels) = [{"name": "factory:ready", "color": "0e8a16"}, {"name": "factory:review", "color": "fbca04"}]' \
+  "$tmp/authored.bak" >"$tmp/authored.json"
+f list --json
+ok "list --json gives an item with the bot its stage" json '.[] | select(.ref == "acme/api#9") | .stage == "factory:review"'
+ok "...and others none" json '.[] | select(.ref == "acme/web#88") | .stage == null'
+jq '(.[] | select(.number == 9) | .labels) = [{"name": "factory:ready", "color": "0e8a16"}]' \
+  "$tmp/authored.bak" >"$tmp/authored.json"
+f list --json
+ok "...the ready label while it waits" json '.[] | select(.ref == "acme/api#9") | .stage == "factory:ready"'
+w list --json
+ok "...and no stage without a bot" json '.[] | select(.ref == "acme/api#9") | .stage == null'
+mv "$tmp/authored.bak" "$tmp/authored.json"
 
 echo
 if [ "$failed" -eq 0 ]; then

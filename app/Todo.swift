@@ -29,6 +29,8 @@ struct Item: Decodable, Identifiable, Hashable {
     let labelColors: [String: String]?
     /// Set when you created the issue but someone else holds it.
     let waitingOn: [String]?
+    /// Set while a build bot has it: the label that says how far it is.
+    let stage: String?
 
     struct Badge: Hashable {
         let text: String
@@ -40,12 +42,14 @@ struct Item: Decodable, Identifiable, Hashable {
     var key: String { ref.lowercased() }
     var waiting: [String] { waitingOn ?? [] }
     var isHighPriority: Bool { labels.contains("priority: high") }
-    /// Labels worth a badge: all of them on personal items, only status on team issues.
+    /// Labels worth a badge: all of them on personal items; on team issues,
+    /// the status and how far a build bot is with it.
     var badges: [Badge] {
-        let shown = personal ? labels : labels.filter { $0.hasPrefix("status: ") }
-        return shown.map {
-            Badge(text: personal ? $0 : String($0.dropFirst("status: ".count)), hex: labelColors?[$0])
+        if personal { return labels.map { Badge(text: $0, hex: labelColors?[$0]) } }
+        let status = labels.filter { $0.hasPrefix("status: ") }.map {
+            Badge(text: String($0.dropFirst("status: ".count)), hex: labelColors?[$0])
         }
+        return status + (stage.map { [Badge(text: $0, hex: labelColors?[$0])] } ?? [])
     }
 
     private static let iso = ISO8601DateFormatter()
@@ -82,12 +86,24 @@ struct Claim: Decodable, Hashable {
 
 /// The agent that works through the items you queue for it (`todo work`), as
 /// `todo queue --json` reports it. `worker` is null when none is set up.
+/// It also says which items `todo queue` takes and which of them go to a
+/// build bot instead.
 struct WorkerQueue: Decodable, Equatable {
     struct Entry: Decodable, Equatable {
         let ref: String
         let since: TimeInterval
     }
 
+    /// A build bot that takes the items of some repos (TODO_FACTORY).
+    struct Factory: Decodable, Equatable {
+        let name: String
+        /// owner/name, lower case.
+        let repos: [String]
+    }
+
+    /// Owners whose repos it takes, lower case; empty: any.
+    let owners: [String]?
+    let factory: Factory?
     let worker: String?
     /// The machine it runs on, when that isn't this one.
     let host: String?
@@ -104,6 +120,19 @@ struct WorkerQueue: Decodable, Equatable {
     func isCurrent(_ item: Item) -> Bool { current?.lowercased() == item.key }
     /// In line behind the current item, in the order it takes them.
     var waiting: [Entry] { (items ?? []).filter { $0.ref.lowercased() != current?.lowercased() } }
+
+    /// Where `todo queue` would send the item, for its menu: the build bot,
+    /// the worker, or nowhere.
+    func spot(for item: Item, busy: Bool) -> QueueSpot? {
+        let repo = item.repo.lowercased()
+        let owner = repo.split(separator: "/").first.map(String.init) ?? repo
+        if let owners, !owners.isEmpty, !owners.contains(owner) { return nil }
+        if let factory, factory.repos.contains(repo) {
+            return QueueSpot(worker: factory.name, queued: item.stage != nil, current: false, busy: busy)
+        }
+        guard worker != nil else { return nil }
+        return QueueSpot(worker: title, queued: contains(item), current: isCurrent(item), busy: busy)
+    }
 
     /// One line for the footer, and the colour of its dot.
     var summary: (text: String, color: Color) {
@@ -317,7 +346,7 @@ final class Store: ObservableObject {
             DispatchQueue.main.async {
                 self.readingQueue = false
                 if let decoded {
-                    let queue = decoded.worker == nil ? nil : decoded
+                    let queue = decoded.worker == nil && decoded.factory == nil ? nil : decoded
                     if queue != self.queue { self.queue = queue }
                 } else {
                     log("todo queue failed: \(r.err)")
@@ -332,13 +361,15 @@ final class Store: ObservableObject {
 
     /// Puts the item on the worker's queue, or takes it off (which stops the
     /// worker if it is on it). The list moves at once; the read that follows
-    /// confirms it.
+    /// confirms it. An item for the build bot changes its labels instead,
+    /// which the list's next read shows.
     func setQueued(_ item: Item, _ queued: Bool) {
-        guard queue != nil, !queueing.contains(item.ref) else { return }
+        guard let queue, !queueing.contains(item.ref) else { return }
+        let toBot = queue.factory?.repos.contains(item.repo.lowercased()) ?? false
         queueing.insert(item.ref)
         perform([queued ? "queue" : "unqueue", item.ref]) { ok in
             self.queueing.remove(item.ref)
-            if ok, var queue = self.queue {
+            if ok, !toBot, var queue = self.queue {
                 var items = queue.items ?? []
                 items.removeAll { $0.ref.lowercased() == item.key }
                 if queued { items.append(.init(ref: item.ref, since: Date().timeIntervalSince1970)) }
@@ -647,10 +678,7 @@ struct PanelView: View {
                                     claims: store.claims(for: item),
                                     closing: store.closing.contains(item.ref),
                                     starting: store.starting[item.ref],
-                                    spot: store.queue.map { q in
-                                        QueueSpot(worker: q.title, queued: q.contains(item), current: q.isCurrent(item),
-                                                  busy: store.queueing.contains(item.ref))
-                                    },
+                                    spot: store.queue?.spot(for: item, busy: store.queueing.contains(item.ref)),
                                     onQueue: { store.setQueued(item, $0) },
                                     onDone: { store.done(item) },
                                     // The new session is where you go next.
@@ -685,7 +713,7 @@ struct PanelView: View {
                     .lineLimit(3)
                     .textSelection(.enabled)
             }
-            if let queue = store.queue {
+            if let queue = store.queue, queue.worker != nil {
                 let summary = queue.summary
                 HStack(spacing: 6) {
                     Image(systemName: "circle.fill")

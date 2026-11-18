@@ -170,6 +170,27 @@ Set it up there with its own config, and on your Mac set `TODO_WORKER_HOST`:
 must load without a prompt). Keep `todo work --watch` running there, for
 instance as a systemd user service.
 
+### A build bot
+
+Some orgs run a bot that builds pull requests from issues on a GitHub project
+board: it takes an open issue that is on the board, assigned to the bot and
+labelled `factory:ready`, and reports its progress in labels with the same
+prefix (`factory:running`, `factory:review`, ...). Name it in `TODO_FACTORY`
+and `todo queue` hands an item to the bot when the item's repo has the ready
+label, and to your worker otherwise:
+
+```bash
+todo queue acme/web#88        # onto acme's board, assigned to the bot, labelled ready
+todo unqueue acme/web#88      # takes the ready label off, which stops the bot
+todo queue                    # what the bot has and how far it is, then the worker
+```
+
+The ready label goes on last, since it starts the job. Your `gh` login needs
+the `project` scope (`gh auth refresh -s project`) and write access to the
+repo. The window shows the bot's stage on each item and offers "Queue for"
+the bot on items in its repos. `TODO_QUEUE_OWNERS` keeps both to the repos of
+the owners you name; `todo queue` refuses the rest.
+
 ## The window
 
 <img src="docs/pill.png" width="90" alt="The folded window: a checklist icon, the number 7 and three coloured dots">
@@ -219,6 +240,12 @@ TODO_WORKER_EFFORT=""                      # --effort
 TODO_WORKER_MAX_USE="0.8"                  # wait for the reset from this share of a limit
 TODO_WORKER_TIMEOUT="7200"                 # stop an item after this many seconds
 TODO_WORKER_RULES=""                       # your own rules, after its built-in ones
+
+# What `todo queue` takes, and build bots (see "A build bot").
+TODO_QUEUE_OWNERS="acme"                   # only these owners' repos; empty: any
+TODO_FACTORY="acme:7:acme-bot"             # org:project-number:bot-login, one per org
+TODO_FACTORY_LABEL="factory:ready"         # the label that starts the bot
+TODO_FACTORY_NAME="the factory"            # what the window and messages call it
 ```
 
 ## Try the window without GitHub

@@ -67,6 +67,21 @@ TODO_QUEUE="${XDG_STATE_HOME:-$HOME/.local/state}/todo/queue"
 TODO_WORKTREES="${XDG_CACHE_HOME:-$HOME/.cache}/todo/worktrees"
 TODO_WORKER_LOGS="${XDG_STATE_HOME:-$HOME/.local/state}/todo/worker-logs"
 
+# The owners (users or orgs) whose repos `todo queue` takes at all, for the
+# worker or a build bot. Space-separated; empty means any.
+TODO_QUEUE_OWNERS="${TODO_QUEUE_OWNERS:-}"
+# Build bots that take issues off an org's GitHub project board. An issue is
+# handed over by adding it to the board, assigning the bot and adding the
+# ready label, which a person has to add. One "org:project-number:bot-login"
+# per org, space-separated. `todo queue` hands an item to the bot when its
+# repo has the ready label, and to the worker otherwise. The bot reports its
+# progress in labels that share the ready label's prefix (factory:running, ...).
+TODO_FACTORY="${TODO_FACTORY:-}"
+TODO_FACTORY_LABEL="${TODO_FACTORY_LABEL:-factory:ready}"
+TODO_FACTORY_NAME="${TODO_FACTORY_NAME:-the factory}"
+# Which repos have the ready label, read at most once an hour.
+TODO_FACTORY_REPOS="${XDG_CACHE_HOME:-$HOME/.cache}/todo/factory-repos"
+
 TODO_CONFIG="${TODO_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/todo/config}"
 # Local settings (TODO_REPO / TODO_HIDE / TODO_ROOTS / ...) without editing this file.
 if [ -f "$TODO_CONFIG" ]; then
@@ -119,8 +134,9 @@ other repo show up too ("→ name" = created by you, held by someone else;
   todo claims [--json]              who works on what; claims lapse when the session
                                     ends or after $((TODO_CLAIM_TTL / 3600)) h without activity
 
-  todo queue [<ref>] [--json]       queue <ref> for your worker agent, or show its queue
-  todo unqueue <ref>                take <ref> off the queue (stops the worker if it is on it)
+  todo queue [<ref>] [--json]       queue <ref> for your worker agent, or hand it to a build
+                                    bot when its repo is the bot's (TODO_FACTORY); or show both
+  todo unqueue <ref>                take <ref> off the queue or back from the bot (stops it)
   todo work [--watch]               be the worker: work through the queue, oldest first, until
                                     it is empty or the usage limit is near; --watch stays on
                                     and waits for new items and for the limit to reset
@@ -406,8 +422,13 @@ list_json() {
 
   # An issue you created but someone else holds gets waitingOn = their logins;
   # working lists the agent sessions that claimed it.
+  # stage: the label that says how far a build bot is with it ("factory:running"),
+  # or the ready label while it waits for the bot.
+  local ready=""
+  if [ -n "$TODO_FACTORY" ]; then ready="$TODO_FACTORY_LABEL"; fi
   jq -n --arg repo "$TODO_REPO" --slurpfile p "$tmp/personal" \
-    --slurpfile a "$tmp/assigned" --slurpfile o "$tmp/authored" --slurpfile c "$tmp/claims" '
+    --slurpfile a "$tmp/assigned" --slurpfile o "$tmp/authored" --slurpfile c "$tmp/claims" \
+    --arg ready "$ready" --arg prefix "$(factory_prefix)" '
     [ ($p[0][] | {repo: $repo, personal: true, mine: true, assignees: []} + .),
       ($a[0][] | {repo: .repository.nameWithOwner, personal: false, mine: true} + del(.repository)),
       ($o[0][] | {repo: .repository.nameWithOwner, personal: false, mine: false} + del(.repository)) ]
@@ -417,6 +438,9 @@ list_json() {
         repo, number, title, url, updatedAt, personal,
         labels: [.labels[].name],
         labelColors: ([.labels[] | {(.name): .color}] | add // {}),
+        stage: ([.labels[].name] as $names
+                | if $ready == "" or (any($names[]; . == $ready) | not) then null
+                  else ([$names[] | select(startswith($prefix) and . != $ready)] | first) // $ready end),
         waitingOn: (if .mine then [] else [.assignees[].login] end)
       })
     | map((.ref | ascii_downcase) as $r
@@ -722,7 +746,7 @@ local_queue_json() {
 }
 
 # The worker and its queue as JSON, from the worker host when there is one.
-queue_json() {
+worker_queue_json() {
   if [ -z "$TODO_WORKER_HOST" ]; then
     local_queue_json
     return
@@ -737,8 +761,157 @@ queue_json() {
   fi
 }
 
+# The worker and its queue, plus what `todo queue` takes and where it sends
+# it: the owners it takes, and the build bot's name and repos.
+queue_json() {
+  local repos
+  repos="$(factory_repos | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+  worker_queue_json | jq -c --arg owners "$TODO_QUEUE_OWNERS" --arg bots "$TODO_FACTORY" \
+    --arg name "$TODO_FACTORY_NAME" --argjson repos "$repos" '
+    . + {owners: ($owners | ascii_downcase | [splits(" +")] | map(select(length > 0))),
+         factory: (if $bots == "" then null else {name: $name, repos: $repos} end)}'
+}
+
 no_worker() {
   die "no worker set up: put TODO_WORKER_NAME (and TODO_WORKER_HOST, if it runs on another machine) in $TODO_CONFIG"
+}
+
+# The repo's owner is one TODO_QUEUE_OWNERS names, or that list is empty.
+queue_takes() {
+  [ -n "$TODO_QUEUE_OWNERS" ] || return 0
+  local owner o
+  owner="$(lower "${1%%/*}")"
+  for o in $TODO_QUEUE_OWNERS; do
+    if [ "$(lower "$o")" = "$owner" ]; then return 0; fi
+  done
+  return 1
+}
+
+# The TODO_FACTORY entry for the repo's org, into FACTORY_ORG, FACTORY_PROJECT
+# and FACTORY_BOT. Fails when the org has no bot.
+factory_for() {
+  local owner entry rest
+  owner="$(lower "${1%%/*}")"
+  for entry in $TODO_FACTORY; do
+    [ "$(lower "${entry%%:*}")" = "$owner" ] || continue
+    FACTORY_ORG="${entry%%:*}"
+    rest="${entry#*:}"
+    FACTORY_PROJECT="${rest%%:*}"
+    FACTORY_BOT="${rest#*:}"
+    case "$FACTORY_PROJECT" in
+      ''|*[!0-9]*) die "TODO_FACTORY entry '$entry' is not org:project-number:bot-login" ;;
+    esac
+    if [ "$rest" = "$FACTORY_BOT" ] || [ -z "$FACTORY_BOT" ]; then
+      die "TODO_FACTORY entry '$entry' is not org:project-number:bot-login"
+    fi
+    return 0
+  done
+  return 1
+}
+
+# The repo has the ready label, so the bot works there. Dies when GitHub can't
+# tell, rather than sending the item to the wrong place.
+factory_works_in() {
+  local err
+  if err="$(gh api "repos/$1/labels/$(uri "$TODO_FACTORY_LABEL")" --silent 2>&1)"; then return 0; fi
+  case "$err" in *"HTTP 404"*) return 1 ;; esac
+  die "can't tell whether $1 has the $TODO_FACTORY_LABEL label: $err"
+}
+
+# The repos (owner/name, lower case, one per line) that have the ready label
+# in the TODO_FACTORY orgs, read at most once an hour. When GitHub can't be
+# read, the last list stands for another hour.
+factory_repos() {
+  [ -n "$TODO_FACTORY" ] || return 0
+  local key="# $TODO_FACTORY $TODO_FACTORY_LABEL" age entry tmp
+  if [ -f "$TODO_FACTORY_REPOS" ] && [ "$(head -n 1 "$TODO_FACTORY_REPOS")" = "$key" ]; then
+    if age="$(mtime "$TODO_FACTORY_REPOS")" && [ $(($(date +%s) - age)) -lt 3600 ]; then
+      tail -n +2 "$TODO_FACTORY_REPOS"
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$TODO_FACTORY_REPOS")"
+  tmp="$TODO_FACTORY_REPOS.$$"
+  printf '%s\n' "$key" >"$tmp"
+  for entry in $TODO_FACTORY; do
+    # shellcheck disable=SC2016
+    if ! gh api graphql --paginate -f org="${entry%%:*}" -f label="$TODO_FACTORY_LABEL" -f query='
+        query($org: String!, $label: String!, $endCursor: String) {
+          organization(login: $org) {
+            repositories(first: 100, after: $endCursor, isArchived: false) {
+              pageInfo { hasNextPage endCursor }
+              nodes { nameWithOwner label(name: $label) { name } } } } }' \
+        --jq '.data.organization.repositories.nodes[] | select(.label) | .nameWithOwner | ascii_downcase' \
+        >>"$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      if [ -f "$TODO_FACTORY_REPOS" ] && [ "$(head -n 1 "$TODO_FACTORY_REPOS")" = "$key" ]; then
+        touch "$TODO_FACTORY_REPOS"
+        tail -n +2 "$TODO_FACTORY_REPOS"
+      fi
+      return 0
+    fi
+  done
+  mv "$tmp" "$TODO_FACTORY_REPOS"
+  tail -n +2 "$TODO_FACTORY_REPOS"
+}
+
+# Hands REF_REPO#REF_NUM to the bot (factory_for has run): onto the board,
+# assigned to the bot, and the ready label last, since that starts the job.
+# The board and the assignee are set even when the label is there already
+# (both are no-ops when done), since the bot ignores an item that lacks one.
+factory_queue() {
+  local info
+  info="$(gh issue view "$REF_NUM" -R "$REF_REPO" --json state,title,url,labels)" || die "can't read $REF_REPO#$REF_NUM"
+  [ "$(jq -r .state <<<"$info")" = OPEN ] || die "$REF_REPO#$REF_NUM is closed"
+  gh project item-add "$FACTORY_PROJECT" --owner "$FACTORY_ORG" --url "$(jq -r .url <<<"$info")" >/dev/null ||
+    die "couldn't put $REF_REPO#$REF_NUM on $FACTORY_ORG's project $FACTORY_PROJECT"
+  gh issue edit "$REF_NUM" -R "$REF_REPO" --add-assignee "$FACTORY_BOT" >/dev/null ||
+    die "couldn't assign $REF_REPO#$REF_NUM to $FACTORY_BOT"
+  if jq -e --arg l "$TODO_FACTORY_LABEL" 'any(.labels[]; .name == $l)' <<<"$info" >/dev/null; then
+    echo "$REF_REPO#$REF_NUM is already with $TODO_FACTORY_NAME"
+    return
+  fi
+  gh issue edit "$REF_NUM" -R "$REF_REPO" --add-label "$TODO_FACTORY_LABEL" >/dev/null ||
+    die "couldn't label $REF_REPO#$REF_NUM $TODO_FACTORY_LABEL"
+  changed
+  echo "handed $REF_REPO#$REF_NUM to $TODO_FACTORY_NAME ($FACTORY_BOT): $(jq -r .title <<<"$info")"
+}
+
+# Takes the ready label off, which stops the bot. Fails when the item isn't
+# with the bot.
+factory_unqueue() {
+  local labels
+  labels="$(gh issue view "$REF_NUM" -R "$REF_REPO" --json labels)" || die "can't read $REF_REPO#$REF_NUM"
+  jq -e --arg l "$TODO_FACTORY_LABEL" 'any(.labels[]; .name == $l)' <<<"$labels" >/dev/null || return 1
+  gh issue edit "$REF_NUM" -R "$REF_REPO" --remove-label "$TODO_FACTORY_LABEL" >/dev/null ||
+    die "couldn't take the $TODO_FACTORY_LABEL label off $REF_REPO#$REF_NUM"
+  changed
+  echo "took $REF_REPO#$REF_NUM back from $TODO_FACTORY_NAME (it stops if it was on it)"
+}
+
+# What the bots have: every open item with the ready label, and how far it is.
+factory_status() {
+  local entry org prefix
+  prefix="$(factory_prefix)"
+  for entry in $TODO_FACTORY; do
+    org="${entry%%:*}"
+    gh search issues --owner "$org" --label "$TODO_FACTORY_LABEL" --state open --limit 100 \
+      --json repository,number,title,labels 2>/dev/null |
+      jq -r --arg name "$TODO_FACTORY_NAME" --arg org "$org" --arg ready "$TODO_FACTORY_LABEL" --arg prefix "$prefix" '
+        "\($name) in \($org): " + (if length == 0 then "nothing handed over" else "\(length) item(s)" end),
+        (sort_by(.repository.nameWithOwner, .number)[]
+         | ([.labels[].name | select(startswith($prefix) and . != $ready)] | first // "waiting") as $stage
+         | "  \(.repository.nameWithOwner)#\(.number)  \($stage | ltrimstr($prefix))  \(.title)")' ||
+      echo "$TODO_FACTORY_NAME in $org: can't read it"
+  done
+}
+
+# The part the bot's labels share: "factory:" for factory:ready.
+factory_prefix() {
+  case "$TODO_FACTORY_LABEL" in
+    *:*) printf '%s:' "${TODO_FACTORY_LABEL%%:*}" ;;
+    *) printf '%s' "$TODO_FACTORY_LABEL" ;;
+  esac
 }
 
 cmd_queue() {
@@ -756,6 +929,11 @@ cmd_queue() {
   fi
   if [ -n "$ref" ]; then
     parse_ref "$ref"
+    queue_takes "$REF_REPO" || die "won't queue $REF_REPO#$REF_NUM: the queue takes repos of $TODO_QUEUE_OWNERS only (TODO_QUEUE_OWNERS)"
+    if factory_for "$REF_REPO" && factory_works_in "$REF_REPO"; then
+      factory_queue
+      return
+    fi
     if [ -n "$TODO_WORKER_HOST" ]; then
       remote queue "$REF_REPO#$REF_NUM" || die "couldn't queue it on $TODO_WORKER_HOST"
       claims_changed
@@ -773,7 +951,12 @@ cmd_queue() {
     fi
     return
   fi
-  queue_json | jq -r --argjson now "$(date +%s)" '
+  if [ -n "$TODO_FACTORY" ]; then
+    factory_status
+    # Without a worker, the bot is all there is.
+    if [ -z "$TODO_WORKER_NAME" ]; then return; fi
+  fi
+  worker_queue_json | jq -r --argjson now "$(date +%s)" '
     def at: strflocaltime("%a %H:%M");
     if .worker == null then "no worker set up (TODO_WORKER_NAME)" else
       "\(.worker)\(if .host then " on \(.host)" else "" end): " + (
@@ -789,6 +972,7 @@ cmd_queue() {
 
 cmd_unqueue() {
   parse_ref "${1:-}"
+  if factory_for "$REF_REPO" && factory_unqueue; then return; fi
   if [ -n "$TODO_WORKER_HOST" ]; then
     remote unqueue "$REF_REPO#$REF_NUM" || die "couldn't reach $TODO_WORKER_HOST"
     claims_changed
