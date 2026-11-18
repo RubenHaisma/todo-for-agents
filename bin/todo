@@ -49,6 +49,11 @@ TODO_WORKER_MAX_USE="${TODO_WORKER_MAX_USE:-0.8}"
 TODO_WORKER_TIMEOUT="${TODO_WORKER_TIMEOUT:-7200}"
 # Instructions of your own for the worker, after its built-in rules.
 TODO_WORKER_RULES="${TODO_WORKER_RULES:-}"
+# The command `todo go` asks which items on your list the worker can do. It
+# reads a JSON array of refs on stdin and prints {"items": [{"ref": ...,
+# "verdict": "doable" | "person" | "blocked", "reason": ..., "size": "S" |
+# "M" | "L"}]}. It runs on TODO_WORKER_HOST when that is set. Empty: no `todo go`.
+TODO_WORKER_TRIAGE="${TODO_WORKER_TRIAGE:-}"
 # Commands its agent may never run, on top of the rules it gets. Prefix
 # matches, so they only back the rules up; set the array in the config to change it.
 TODO_WORKER_DENY=(
@@ -137,9 +142,17 @@ other repo show up too ("→ name" = created by you, held by someone else;
   todo queue [<ref>] [--json]       queue <ref> for your worker agent, or hand it to a build
                                     bot when its repo is the bot's (TODO_FACTORY); or show both
   todo unqueue <ref>                take <ref> off the queue or back from the bot (stops it)
+  todo do <title> [-r owner/repo] [-b body]
+                                    add an item and queue it at once; prints its ref
+  todo go [--yes] [--json]          ask the triage command (TODO_WORKER_TRIAGE) which items on
+                                    your list the worker can do; --yes queues those
+  todo stop [--now]                 the worker starts nothing new; --now also stops what it
+                                    works on, which stays queued
+  todo resume                       lift todo stop
   todo work [--watch]               be the worker: work through the queue, oldest first, until
-                                    it is empty or the usage limit is near; --watch stays on
-                                    and waits for new items and for the limit to reset
+                                    it is empty, the usage limit is near or todo stop is on;
+                                    --watch stays on and waits for new items, for the limit to
+                                    reset and for todo resume
 
 <ref> is 12 (= $repo#12), owner/repo#12, or an issue URL.
 EOF
@@ -437,6 +450,7 @@ list_json() {
         ref: "\(.repo)#\(.number)",
         repo, number, title, url, updatedAt, personal,
         labels: [.labels[].name],
+        assignees: [.assignees[].login],
         labelColors: ([.labels[] | {(.name): .color}] | add // {}),
         stage: ([.labels[].name] as $names
                 | if $ready == "" or (any($names[]; . == $ready) | not) then null
@@ -485,11 +499,12 @@ cmd_add() {
 
   local body_args=(--body "$body")
   [ -z "$body_file" ] || body_args=(--body-file "$body_file")
-  local url
-  url="$(gh issue create -R "$repo" --title "$title" "${body_args[@]}" --assignee @me \
+  # ADDED_REF is for todo do, which queues it next.
+  ADDED_URL="$(gh issue create -R "$repo" --title "$title" "${body_args[@]}" --assignee @me \
     ${labels[@]+"${labels[@]}"})"
+  ADDED_REF="$repo#${ADDED_URL##*/}"
   changed
-  echo "added $repo#${url##*/}  $url"
+  echo "added $ADDED_REF  $ADDED_URL"
 }
 
 cmd_note() {
@@ -737,12 +752,27 @@ local_queue_json() {
   fi
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then status=stopped; current=""; until=""; fi
   { if [ -f "$TODO_QUEUE" ]; then cat "$TODO_QUEUE"; fi; } | jq -R -s -c --arg worker "$TODO_WORKER_NAME" \
-    --arg status "$status" --arg current "$current" --arg until "$until" --arg detail "$detail" --arg since "$since" '
+    --arg status "$status" --arg current "$current" --arg until "$until" --arg detail "$detail" --arg since "$since" \
+    --arg stop "$(stop_mode)" '
     def num: if . == "" then null else tonumber end;
     {worker: $worker, host: null, status: $status,
      current: (if $current == "" then null else $current end),
      since: ($since | num), until: ($until | num), detail: $detail,
+     stop: (if $stop == "none" then null else $stop end),
      items: (split("\n") | map(select(length > 0) | split("\t") | {ref: .[0], since: (.[1] | tonumber)}))}'
+}
+
+# What `todo stop` asked of the worker: none, pause (start nothing new) or now
+# (stop the running item too). The stop file sits next to the queue, so every
+# worker of the queue reads it; it holds "now" or nothing.
+stop_mode() {
+  if [ ! -f "$TODO_QUEUE.stop" ]; then
+    echo none
+  elif [ "$(tr -d '[:space:]' <"$TODO_QUEUE.stop" 2>/dev/null)" = now ]; then
+    echo now
+  else
+    echo pause
+  fi
 }
 
 # The worker and its queue as JSON, from the worker host when there is one.
@@ -757,7 +787,7 @@ worker_queue_json() {
   else
     jq -n -c --arg worker "$TODO_WORKER_NAME" --arg host "$TODO_WORKER_HOST" '
       {worker: (if $worker == "" then null else $worker end), host: $host, status: "unreachable",
-       current: null, since: null, until: null, detail: "", items: []}'
+       current: null, since: null, until: null, detail: "", stop: null, items: []}'
   fi
 }
 
@@ -961,10 +991,12 @@ cmd_queue() {
     if .worker == null then "no worker set up (TODO_WORKER_NAME)" else
       "\(.worker)\(if .host then " on \(.host)" else "" end): " + (
         if .status == "working" then "working on \(.current) for \((($now - .since) / 60) | floor) min"
-        elif .status == "paused" then "paused until \(.until | at)\(if .detail != "" then " (\(.detail))" else "" end)"
+        elif .status == "paused" then "paused\(if .until then " until \(.until | at)" else "" end)\(if .detail != "" then " (\(.detail))" else "" end)"
         elif .status == "idle" then "waiting for work"
         elif .status == "unreachable" then "can'"'"'t reach \(.host)"
-        else "not running (start it with: todo work --watch)" end),
+        else "not running (start it with: todo work --watch)" end)
+      + (if (.stop // null) == null or .detail == "stopped with todo stop" then ""
+         else "; todo stop\(if .stop == "now" then " --now" else "" end) is on until todo resume" end),
       (if (.items | length) == 0 then "  nothing queued"
        else .items[] | "  \(.ref)  queued \(.since | at)" end)
     end'
@@ -985,6 +1017,183 @@ cmd_unqueue() {
   else
     echo "$REF_REPO#$REF_NUM is not in $TODO_WORKER_NAME's queue"
   fi
+}
+
+# todo stop [--now]: the worker starts nothing new until todo resume; --now
+# also stops the item it works on, which stays queued.
+cmd_stop() {
+  local mode=pause
+  [ $# -le 1 ] || die "usage: todo stop [--now]"
+  case "${1:-}" in
+    --now) mode=now ;;
+    '') ;;
+    *) die "usage: todo stop [--now]" ;;
+  esac
+  if [ -n "$TODO_WORKER_HOST" ]; then
+    remote stop "$@" || die "couldn't stop the worker on $TODO_WORKER_HOST"
+    claims_changed
+    return
+  fi
+  [ -n "$TODO_WORKER_NAME" ] || no_worker
+  mkdir -p "$(dirname "$TODO_QUEUE")"
+  if [ "$mode" = now ]; then echo now >"$TODO_QUEUE.stop.tmp"; else : >"$TODO_QUEUE.stop.tmp"; fi
+  mv "$TODO_QUEUE.stop.tmp" "$TODO_QUEUE.stop"
+  claims_changed
+  if [ "$mode" = now ]; then
+    echo "$TODO_WORKER_NAME stops what it works on (it stays queued) and starts nothing new until todo resume"
+  else
+    echo "$TODO_WORKER_NAME finishes what it works on and starts nothing new until todo resume"
+  fi
+}
+
+cmd_resume() {
+  [ $# -eq 0 ] || die "usage: todo resume"
+  if [ -n "$TODO_WORKER_HOST" ]; then
+    remote resume || die "couldn't resume the worker on $TODO_WORKER_HOST"
+    claims_changed
+    return
+  fi
+  [ -n "$TODO_WORKER_NAME" ] || no_worker
+  if [ -f "$TODO_QUEUE.stop" ]; then
+    rm -f "$TODO_QUEUE.stop"
+    claims_changed
+    echo "$TODO_WORKER_NAME goes on with the queue"
+  else
+    echo "$TODO_WORKER_NAME wasn't stopped"
+  fi
+}
+
+# todo do <title> [-r owner/repo] [-b body]: todo add, then todo queue. Prints
+# the ref on stdout and the rest on stderr, so ref="$(todo do ...)" works.
+cmd_do() {
+  local title="" body="" repo="$TODO_REPO"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b|--body) body="${2:-}"; shift 2 ;;
+      -r|--repo) repo="${2:-}"; shift 2 ;;
+      -*) die "unknown option for do: $1" ;;
+      *) [ -z "$title" ] || die "title given twice; quote it"; title="$1"; shift ;;
+    esac
+  done
+  [ -n "$title" ] || die "usage: todo do <title> [-r owner/repo] [-b body]"
+  case "$repo" in
+    */*) ;;
+    *) die "not a repo: $repo (use owner/repo)" ;;
+  esac
+  # Refuse before the issue exists, rather than leave one nothing works on.
+  queue_takes "$repo" || die "won't queue an item in $repo: the queue takes repos of $TODO_QUEUE_OWNERS only (TODO_QUEUE_OWNERS)"
+  if [ -z "$TODO_WORKER_NAME" ] && [ -z "$TODO_WORKER_HOST" ] &&
+    ! { factory_for "$repo" && factory_works_in "$repo"; }; then
+    no_worker
+  fi
+  cmd_add "$title" -r "$repo" -b "$body" >&2
+  (cmd_queue "$ADDED_REF") >&2 || die "added $ADDED_REF, but it isn't queued: todo queue $ADDED_REF"
+  echo "$ADDED_REF"
+}
+
+# The open items on your list that `todo queue` would take, as a JSON array
+# of {ref, title}: in a repo TODO_QUEUE_OWNERS takes, not queued yet, and not
+# with a build bot (one of its labels, or assigned to it).
+go_candidates() {
+  local list queue bots="" entry
+  list="$(list_json)" || exit 1
+  queue="$(worker_queue_json)"
+  for entry in $TODO_FACTORY; do bots="$bots ${entry##*:}"; done
+  jq -c --argjson queue "$queue" --arg owners "$TODO_QUEUE_OWNERS" --arg bots "$bots" \
+    --arg prefix "$(factory_prefix)" '
+    def words: ascii_downcase | [splits(" +")] | map(select(length > 0));
+    ($owners | words) as $owners
+    | ($bots | words) as $bots
+    | [$queue.items // [] | .[].ref | ascii_downcase] as $queued
+    | [.[] | (.repo | split("/")[0] | ascii_downcase) as $owner
+        | (.ref | ascii_downcase) as $ref
+        | select(($owners == [] or any($owners[]; . == $owner))
+            and (any($queued[]; . == $ref) | not)
+            and (any(.labels[]; startswith($prefix)) | not)
+            and (any(.assignees[] | ascii_downcase; . as $a | any($bots[]; . == $a)) | not))
+        | {ref, title}]' <<<"$list"
+}
+
+# Runs the triage command, on the worker host when there is one, with the
+# refs on stdin.
+run_triage() {
+  if [ -n "$TODO_WORKER_HOST" ]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$TODO_WORKER_HOST" "$TODO_WORKER_TRIAGE"
+  else
+    bash -c "$TODO_WORKER_TRIAGE"
+  fi
+}
+
+# todo go [--yes] [--json]: what the triage command makes of the items the
+# queue would take; --yes queues the doable ones.
+cmd_go() {
+  local yes=0 json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1; shift ;;
+      --json) json=1; shift ;;
+      *) die "usage: todo go [--yes] [--json]" ;;
+    esac
+  done
+  [ -n "$TODO_WORKER_TRIAGE" ] ||
+    die "no triage command set: put TODO_WORKER_TRIAGE in $TODO_CONFIG (it reads a JSON array of refs and prints {\"items\": [...]}; see the README)"
+  local items refs out verdicts status=0
+  items="$(go_candidates)" || exit 1
+  refs="$(jq -c 'map(.ref)' <<<"$items")"
+  if [ "$refs" = "[]" ]; then
+    if [ "$json" -eq 1 ]; then echo '{"items":[]}'; else echo "nothing on your list for the queue"; fi
+    return
+  fi
+  out="$(run_triage <<<"$refs")" || status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 255 ] && [ -n "$TODO_WORKER_HOST" ]; then die "couldn't reach $TODO_WORKER_HOST"; fi
+    die "the triage command failed (exit $status)"
+  fi
+  # One JSON object with an items array. Of its items, only the refs it was
+  # given, each once, with a known verdict; the ref as the list spells it.
+  verdicts="$(jq -c -s --argjson refs "$refs" '
+    if length == 1 and (.[0] | type) == "object" and (.[0].items | type) == "array" then .[0]
+    else error("no items") end
+    | reduce (.items[] | objects | select((.ref | type) == "string")
+              | (.ref | ascii_downcase) as $r
+              | {ref: ([$refs[] | select(ascii_downcase == $r)] | first),
+                 verdict, reason: (.reason // "" | tostring),
+                 size: (if .size == "S" or .size == "M" or .size == "L" then .size else null end)}
+              | select(.ref != null and (.verdict == "doable" or .verdict == "person" or .verdict == "blocked")))
+        as $i ([]; if any(.[]; .ref == $i.ref) then . else . + [$i] end)
+    | {items: .}' <<<"$out" 2>/dev/null)" ||
+    die "the triage command didn't print {\"items\": [...]}: $(printf '%s' "$out" | head -c 200)"
+
+  if [ "$json" -eq 1 ]; then
+    printf '%s\n' "$verdicts"
+  else
+    jq -r --argjson cands "$items" '
+      .items as $items
+      | (reduce $cands[] as $c ({}; .[$c.ref] = $c.title)) as $titles
+      | (["doable", "person", "blocked"][] as $v
+         | [$items[] | select(.verdict == $v)]
+         | select(length > 0)
+         | "\($v) (\(length)):",
+           (.[] | "  \(.ref)  \(.size // "-")  \($titles[.ref])\(if .reason != "" then ": \(.reason)" else "" end)")),
+        ([$cands[].ref | select(. as $r | any($items[]; .ref == $r) | not)]
+         | select(length > 0) | "not judged: \(join(", "))")' <<<"$verdicts"
+  fi
+  [ "$yes" -eq 1 ] || return 0
+
+  local doable ref failed=0
+  doable="$(jq -r '.items[] | select(.verdict == "doable") | .ref' <<<"$verdicts")"
+  if [ -z "$doable" ]; then
+    echo "nothing doable to queue" >&2
+    return 0
+  fi
+  while IFS= read -r ref; do
+    if [ "$json" -eq 1 ]; then
+      (cmd_queue "$ref") >&2 || failed=1
+    else
+      (cmd_queue "$ref") || failed=1
+    fi
+  done <<<"$doable"
+  [ "$failed" -eq 0 ] || die "some doable items aren't queued"
 }
 
 # Runs the worker's claude in place of this shell, as the worker's account,
@@ -1097,7 +1306,8 @@ worker_note() {
 
 # run_item <ref>: one item, start to finish. Returns 0 when the item is done
 # with (it leaves the queue), 3 to keep it and wait until PAUSE_UNTIL, for
-# the reason in PAUSE_WHY.
+# the reason in PAUSE_WHY, and 4 when todo stop --now stopped it (it stays
+# queued).
 run_item() {
   local ref="$1" info title dir branch wt="" where="" sid log started status=0 outcome="" result
   parse_ref "$ref"
@@ -1154,12 +1364,14 @@ Read the issue and its comments first: \`todo show $ref\`. $where"
   worker_state working "$ref"
   echo "todo work: working on $ref (log: $log)"
 
-  # Wait for the agent; stop it after the timeout, or once it is unqueued.
+  # Wait for the agent; stop it after the timeout, once it is unqueued, or
+  # on todo stop --now.
   local ticks=0
   while kill -0 "$AGENT_PID" 2>/dev/null; do
     nap 1
     ticks=$((ticks + 1))
     if [ $(($(date +%s) - started)) -ge "$TODO_WORKER_TIMEOUT" ]; then outcome=timeout; stop_agent; break; fi
+    if [ -f "$TODO_QUEUE.stop" ] && [ "$(stop_mode)" = now ]; then outcome=stopped; stop_agent; break; fi
     if [ $((ticks % 5)) -eq 0 ] && ! queue_has "$ref"; then outcome=cancelled; stop_agent; break; fi
   done
   wait "$AGENT_PID" 2>/dev/null || status=$?
@@ -1194,7 +1406,11 @@ Read the issue and its comments first: \`todo show $ref\`. $where"
       outcome="done"
     fi
   fi
-  [ -z "$wt" ] || [ "$outcome" = limited ] || tidy_worktree "$WORK_DIR" "$wt" "$branch"
+  # A limited or stopped item runs again, so its worktree stays as it is.
+  case "$outcome" in
+    limited|stopped) ;;
+    *) [ -z "$wt" ] || tidy_worktree "$WORK_DIR" "$wt" "$branch" ;;
+  esac
   local left=""
   [ -z "$wt" ] || ! git -C "$WORK_DIR" show-ref --verify --quiet "refs/heads/$branch" || left=" Work so far is on the branch $branch."
   case "$outcome" in
@@ -1214,6 +1430,9 @@ $text" ;;
 Ran out of time: stopped after $minutes min without finishing.$left" ;;
     cancelled)
       echo "todo work: stopped $ref: it was taken off the queue.$left" >&2 ;;
+    stopped)
+      echo "todo work: stopped $ref with todo stop --now; it stays queued.$left" >&2
+      return 4 ;;
     error)
       # A run that never got going (not logged in, claude missing) is the
       # worker's problem, not the item's: keep it and try again later.
@@ -1275,6 +1494,12 @@ cmd_work() {
       nap 15
       continue
     fi
+    if [ -f "$TODO_QUEUE.stop" ]; then
+      worker_state paused "" "" "stopped with todo stop"
+      if [ "$watch" -eq 0 ]; then echo "todo work: stopped with todo stop; todo resume goes on"; return 75; fi
+      nap 5
+      continue
+    fi
     if ! usage_ok; then
       worker_state paused "" "$PAUSE_UNTIL" "usage at $USE%"
       if [ "$watch" -eq 0 ]; then
@@ -1290,6 +1515,9 @@ cmd_work() {
       queue_remove "$ref" || true
       continue
     fi
+    # Stopped with todo stop --now: the item stays, and the loop waits for
+    # todo resume.
+    [ "$status" -ne 4 ] || continue
     worker_state paused "$ref" "$PAUSE_UNTIL" "$PAUSE_WHY"
     [ "$watch" -eq 1 ] || return 75
     nap $((PAUSE_UNTIL > $(date +%s) ? PAUSE_UNTIL - $(date +%s) + 60 : 600))
@@ -1311,7 +1539,11 @@ case "$sub" in
   reopen) cmd_reopen "$@" ;;
   show|view) cmd_show "$@" ;;
   open|web) cmd_open "$@" ;;
-  start|do) cmd_start "$@" ;;
+  start) cmd_start "$@" ;;
+  do) cmd_do "$@" ;;
+  go) cmd_go "$@" ;;
+  stop) cmd_stop "$@" ;;
+  resume) cmd_resume "$@" ;;
   where) cmd_where "$@" ;;
   index) index_checkouts; echo "$(wc -l <"$TODO_CHECKOUTS" | tr -d ' ') checkouts in $TODO_CHECKOUTS" ;;
   claim|working) cmd_claim "$@" ;;

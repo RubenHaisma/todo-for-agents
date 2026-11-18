@@ -177,9 +177,18 @@ if [ -n "${SSH_DOWN:-}" ]; then echo "ssh: connect to host $1 port 22: Operation
 exec env -i HOME="$HOME" PATH="$dir/host-bin:$PATH" LANG=en_US.UTF-8 TODO_CONFIG="$dir/worker.config" \
   XDG_STATE_HOME="$dir/host-state" bash -c "$2"
 EOF
+cat >"$tmp/bin/triage" <<'EOF'
+#!/usr/bin/env bash
+# Triage stand-in for todo go: keeps what it reads in triage.in and prints
+# triage.out.
+dir="$(cd "$(dirname "$0")/.." && pwd)"
+cat >"$dir/triage.in"
+cat "$dir/triage.out"
+EOF
 mkdir -p "$tmp/host-bin"
 ln -s "$root/bin/todo" "$tmp/host-bin/todo"
-chmod +x "$tmp/bin/gh" "$tmp/bin/open" "$tmp/bin/ps" "$tmp/bin/claude" "$tmp/bin/ssh"
+ln -s "$tmp/bin/triage" "$tmp/host-bin/triage"
+chmod +x "$tmp/bin/gh" "$tmp/bin/open" "$tmp/bin/ps" "$tmp/bin/claude" "$tmp/bin/ssh" "$tmp/bin/triage"
 echo $$ >"$tmp/ps.pid"
 
 cat >"$tmp/personal.json" <<'EOF'
@@ -280,6 +289,7 @@ t TODO_CONFIG="$tmp/none" rules
 ok "rules work without a config" says 'todo claim <ref>'
 t TODO_CONFIG="$tmp/none" help
 ok "help works without a config" says "todo release"
+ok "...and lists the worker's controls" sh -c 'for c in "todo do <title>" "todo go [--yes] [--json]" "todo stop [--now]" "todo resume"; do case "$1" in *"$c"*) ;; *) exit 1 ;; esac; done' _ "$out"
 t frobnicate
 ok "an unknown command exits 2" [ "$code" -eq 2 ]
 
@@ -446,6 +456,13 @@ bg() {
   env -i HOME="$home" PATH="$tmp/bin:$PATH" LANG=en_US.UTF-8 TODO_CONFIG="$tmp/worker.config" \
     "$root/bin/todo" "$@" >"$tmp/bg.out" 2>&1 &
   bg=$!
+}
+# bg_wait [seconds]: wait for bg to end (20 s at most, then stop it), and set
+# code and out from it.
+bg_wait() {
+  for _ in $(seq $((${1:-20} * 5))); do kill -0 "$bg" 2>/dev/null || break; sleep 0.2; done
+  if kill -0 "$bg" 2>/dev/null; then kill -TERM "$bg" 2>/dev/null || true; fi
+  code=0; wait "$bg" || code=$?; out="$(cat "$tmp/bg.out")"
 }
 # until_json <jq> <todo args>: poll (5 s at most) until the output matches.
 until_json() {
@@ -749,6 +766,185 @@ ok "...the ready label while it waits" json '.[] | select(.ref == "acme/api#9") 
 w list --json
 ok "...and no stage without a bot" json '.[] | select(.ref == "acme/api#9") | .stage == null'
 mv "$tmp/authored.bak" "$tmp/authored.json"
+
+echo "# stop and resume"
+stopfile="$home/.local/state/todo/queue.stop"
+t stop
+ok "stop without a worker says how to set one up" fails_with "no worker set up"
+w stop --now soon
+ok "stop takes --now and nothing else" fails_with "usage: todo stop [--now]"
+w stop
+ok "stop tells the worker to start nothing new" says "otto finishes what it works on and starts nothing new until todo resume"
+ok "...in an empty stop file next to the queue" sh -c '[ -f "$1" ] && [ ! -s "$1" ]' _ "$stopfile"
+w queue --json
+ok "...which queue --json shows" json '.stop == "pause"'
+w queue 20
+w work
+ok "a stopped worker starts nothing" exits 75 "stopped with todo stop; todo resume goes on"
+ok "...not even the next item" [ "$(runs me/todo#20)" -eq 0 ]
+w queue --json
+ok "...which stays queued" json '.items | map(.ref) == ["me/todo#20"]'
+w queue
+ok "queue says todo stop is on" line '^otto: not running \(start it with: todo work --watch\); todo stop is on until todo resume$'
+bg work --watch
+until_json '.status == "paused"' queue --json
+ok "a watching worker waits while todo stop is on" json '.status == "paused" and .until == null and .detail == "stopped with todo stop"'
+w queue
+ok "...and says so" line '^otto: paused \(stopped with todo stop\)$'
+kill -TERM "$bg"
+wait "$bg" || true
+w resume
+ok "resume lifts todo stop" says "otto goes on with the queue"
+ok "...by taking the stop file away" gone "$stopfile"
+w queue --json
+ok "...which queue --json shows" json '.stop == null'
+w work
+ok "...and the worker goes on" says "done me/todo#20"
+w resume
+ok "resume when nothing is stopped says so" says "otto wasn't stopped"
+
+echo slow >"$tmp/claude.mode"
+rm -f "$tmp/slow.pid"
+w queue 21
+bg work
+until_json '.status == "working"' queue --json
+for _ in $(seq 25); do [ ! -s "$tmp/slow.pid" ] || break; sleep 0.2; done
+w stop --now
+ok "stop --now also stops what the worker works on" says "otto stops what it works on (it stays queued)"
+ok "...with now in the stop file" [ "$(cat "$stopfile")" = now ]
+w queue --json
+ok "...which queue --json shows" json '.stop == "now"'
+# The agent would run for 37 s; it has 15.
+for _ in $(seq 75); do kill -0 "$(cat "$tmp/slow.pid")" 2>/dev/null || break; sleep 0.2; done
+ok "...and its agent is gone soon after" sh -c '[ -s "$1" ] && ! kill -0 "$(cat "$1")" 2>/dev/null' _ "$tmp/slow.pid"
+bg_wait
+ok "the worker stops the run and then waits" exits 75 "stopped me/todo#21 with todo stop --now; it stays queued."
+ok "...without a note" gone "$tmp/note.21"
+w queue --json
+ok "...and the item stays queued" json '.items | map(.ref) == ["me/todo#21"]'
+w resume
+echo ok >"$tmp/claude.mode"
+w work
+ok "after resume the item runs again" says "done me/todo#21"
+
+m stop --now
+ok "stop on a machine whose worker is elsewhere stops it there" grep -qF "devbox todo stop --now" "$tmp/ssh.log"
+ok "...in that machine's stop file" [ "$(cat "$tmp/host-state/todo/queue.stop")" = now ]
+ok "...not this one's" gone "$stopfile"
+m queue --json
+ok "...which queue --json shows" json '.host == "devbox" and .stop == "now"'
+m resume
+ok "resume lifts it there" grep -qF "devbox todo resume" "$tmp/ssh.log"
+ok "...by taking that stop file away" gone "$tmp/host-state/todo/queue.stop"
+m SSH_DOWN=1 stop
+ok "stop on a machine out of reach fails" fails_with "couldn't stop the worker on devbox"
+m SSH_DOWN=1 resume
+ok "...and so does resume" fails_with "couldn't resume the worker on devbox"
+
+echo "# do"
+t "do" "Nobody does it" -r acme/web
+ok "do without a worker says how to set one up" fails_with "no worker set up"
+ok "...before it adds the item" not_logged "--title Nobody does it"
+t TODO_FACTORY="acme:7:acme-bot" "do" "No bot here" -r acme/api
+ok "...also in an org with a bot, in a repo it doesn't work in" fails_with "no worker set up"
+ok "...before it adds the item there either" not_logged "--title No bot here"
+f "do" "Elsewhere" -r other/repo
+ok "do refuses a repo the queue doesn't take" fails_with "won't queue an item in other/repo: the queue takes repos of Acme only"
+ok "...before it adds the item" not_logged "--title Elsewhere"
+w "do" -r acme/web
+ok "do needs a title" fails_with "usage: todo do <title>"
+w "do" "Ship it" -r acme/web -b "Done when shipped"
+ok "do adds the item" logged "issue create -R acme/web --title Ship it --body Done when shipped --assignee @me"
+ok "...and queues it for the worker" has "queued acme/web#42 for otto"
+w queue --json
+ok "...which is in the queue" json '.items | map(.ref) == ["acme/web#42"]'
+w unqueue acme/web#42
+ref="$(env -i HOME="$home" PATH="$tmp/bin:$PATH" LANG=en_US.UTF-8 TODO_CONFIG="$tmp/worker.config" \
+  "$root/bin/todo" "do" "Ship it" -r acme/web 2>/dev/null)"
+ok "...printing only the ref on stdout" [ "$ref" = "acme/web#42" ]
+w unqueue acme/web#42
+t TODO_FACTORY="acme:7:acme-bot" "do" "For the bot" -r acme/web
+ok "do without a worker hands an item in the bot's repo to the bot" says "handed acme/web#42 to the factory (acme-bot)"
+m "do" "Over there" -r acme/web
+ok "do on a machine whose worker is elsewhere queues it there" grep -qF "devbox todo queue acme/web#42" "$tmp/ssh.log"
+m unqueue acme/web#42
+
+echo "# go"
+# Nothing has the ready label, so the queue sends acme's items to the worker.
+: >"$tmp/labelled"
+cp "$tmp/assigned.json" "$tmp/assigned.bak"
+issue() { # <repo> <number> <title> <labels> <assignees>
+  jq -n -c --arg repo "$1" --argjson n "$2" --arg title "$3" --argjson labels "$4" --argjson as "$5" \
+    '{number: $n, title: $title, url: "https://github.com/\($repo)/issues/\($n)", updatedAt: "2026-10-04T00:00:00Z",
+      labels: [$labels[] | {name: ., color: "cccccc"}], repository: {nameWithOwner: $repo},
+      assignees: [$as[] | {login: .}]}'
+}
+{ echo "[$team"
+  echo ",$(issue acme/web 60 "With the bot" '["factory:running"]' '["me"]')"
+  echo ",$(issue acme/web 61 "Assigned to the bot" '[]' '["me", "Acme-Bot"]')"
+  echo ",$(issue acme/api 62 "Queued already" '[]' '["me"]')"
+  echo ",$(issue acme/web 63 "Unclear" '[]' '["me"]')"
+  echo ",$(issue other/repo 3 "Not for the queue" '[]' '["me"]')]"
+} >"$tmp/assigned.json"
+f queue acme/api#62
+fed() { jq -e "$1" "$tmp/triage.in" >/dev/null 2>&1; }
+cat >"$tmp/triage.out" <<'EOF'
+{"items": [
+  {"ref": "ACME/WEB#88", "verdict": "doable", "reason": "clear fix", "size": "S"},
+  {"ref": "acme/api#9", "verdict": "person", "reason": "Alex decides", "size": "XL"},
+  {"ref": "acme/web#61", "verdict": "doable", "reason": "not asked"},
+  {"ref": "acme/web#88", "verdict": "blocked", "reason": "said twice"},
+  {"ref": "acme/web#63", "verdict": "maybe"}
+]}
+EOF
+f go
+ok "go without a triage command says how to set one" fails_with "no triage command set: put TODO_WORKER_TRIAGE in"
+f TODO_WORKER_TRIAGE=triage go --json
+ok "go sends the triage command the refs the queue would take" fed '. == ["acme/api#9", "acme/web#63", "acme/web#88"]'
+ok "...not the ones in repos it doesn't take" fed 'index("other/repo#3") == null and index("me/todo#5") == null'
+ok "...nor queued ones" fed 'index("acme/api#62") == null'
+ok "...nor ones with a bot label" fed 'index("acme/web#60") == null'
+ok "...nor ones assigned to a bot, whatever the case" fed 'index("acme/web#61") == null'
+ok "go --json prints the verdicts on the refs it sent, the first one for each" json '.items | map([.ref, .verdict]) == [["acme/web#88", "doable"], ["acme/api#9", "person"]]'
+ok "...with the reason and the size" json '.items[0] | .reason == "clear fix" and .size == "S"'
+ok "...but no size other than S, M or L" json '.items[1].size == null'
+w TODO_WORKER_TRIAGE=triage go --json
+ok "...and every owner's items without TODO_QUEUE_OWNERS" fed 'index("me/todo#5") != null and index("other/repo#3") != null'
+f TODO_WORKER_TRIAGE=triage go
+ok "go lists the items by verdict" line '^doable \(1\):$'
+ok "...with size, title and reason" line '^  acme/web#88  S  Team issue: clear fix$'
+ok "...in each group" line '^  acme/api#9  -  Waiting on Alex: Alex decides$'
+ok "...and the ones it didn't judge" line '^not judged: acme/web#63$'
+w queue --json
+ok "...without queueing anything" json '.items | map(.ref) == ["acme/api#62"]'
+f TODO_WORKER_TRIAGE=triage go --yes
+ok "go --yes queues the doable items" says "queued acme/web#88 for otto"
+w queue --json
+ok "...and only those" json '.items | map(.ref) == ["acme/api#62", "acme/web#88"]'
+w unqueue acme/web#88
+for bad in "not json" "" '{"items": 3}' '{"items": []} {"items": []}'; do
+  printf '%s' "$bad" >"$tmp/triage.out"
+  f TODO_WORKER_TRIAGE=triage go
+  ok "go refuses triage output that isn't one {\"items\": [...]}: '$bad'" fails_with "the triage command didn't print {\"items\": [...]}"
+done
+f TODO_WORKER_TRIAGE="exit 3" go
+ok "go says when the triage command fails" fails_with "the triage command failed (exit 3)"
+rm -f "$tmp/triage.in"
+f TODO_WORKER_TRIAGE=triage TODO_QUEUE_OWNERS=nobody go
+ok "go with nothing for the queue says so" says "nothing on your list for the queue"
+ok "...without asking the triage command" gone "$tmp/triage.in"
+echo '{"items": [{"ref": "acme/web#88", "verdict": "doable", "reason": "", "size": "M"}]}' >"$tmp/triage.out"
+m TODO_WORKER_TRIAGE=triage TODO_QUEUE_OWNERS=Acme go --json
+ok "go on a machine whose worker is elsewhere runs the triage command there" grep -qF "devbox triage" "$tmp/ssh.log"
+ok "...with the refs on its stdin" fed 'index("acme/web#88") != null'
+ok "...and prints its verdicts" json '.items == [{ref: "acme/web#88", verdict: "doable", reason: "", size: "M"}]'
+m TODO_WORKER_TRIAGE=triage TODO_QUEUE_OWNERS=Acme go --yes
+ok "go --yes there queues on that machine" grep -qF "devbox todo queue acme/web#88" "$tmp/ssh.log"
+m unqueue acme/web#88
+m SSH_DOWN=1 TODO_WORKER_TRIAGE=triage TODO_QUEUE_OWNERS=Acme go
+ok "go on a machine out of reach fails" fails_with "couldn't reach devbox"
+w unqueue acme/api#62
+mv "$tmp/assigned.bak" "$tmp/assigned.json"
 
 echo
 if [ "$failed" -eq 0 ]; then

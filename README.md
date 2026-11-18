@@ -89,6 +89,7 @@ todo release                  # ...and is done with it
 todo claims                   # who works on what
 todo queue acme/web#88        # hand it to your worker agent
 todo queue                    # what the worker is doing and what is next
+todo do "Bump the SDK" -r acme/web   # add an item and queue it at once
 ```
 
 A ref is `12` (an issue in your to-do repo), `owner/repo#12`, or an issue URL.
@@ -137,7 +138,12 @@ time and oldest first, while nobody watches.
 
 ```bash
 todo queue acme/web#88        # queue it (refused when the issue is closed)
+todo do "Bump the SDK" -r acme/web   # add an item and queue it; prints its ref
 todo unqueue acme/web#88      # take it off again; stops the worker if it is on it
+todo stop                     # start nothing new; what it works on finishes
+todo stop --now               # ...and stop what it works on too; it stays queued
+todo resume                   # go on with the queue
+todo go                       # which items on your list the worker could do
 todo work --watch             # be the worker: keep working, wait for new items
 ```
 
@@ -164,11 +170,55 @@ Queued items get a section of their own, in the order the worker takes them,
 and the footer says what the worker is doing. Right-click an item to queue it
 or take it off.
 
+`todo do` refuses a repo that `TODO_QUEUE_OWNERS` leaves out before it adds
+anything. It prints only the new ref on stdout, so `ref="$(todo do ...)"`
+works.
+
+`todo stop` writes a stop file next to the queue
+(`~/.local/state/todo/queue.stop`). While it is there the worker starts no new
+item; with items queued it shows as paused, "stopped with todo stop". If the
+file says `now`, as after `todo stop --now`, the worker also stops the agent
+on its current item. That item stays queued and, after `todo resume`, runs
+again in the worktree it left. `todo resume` removes the file. `todo queue
+--json` reports it as `"stop"`: `null`, `"pause"` or `"now"`. Any other program
+that works the same queue can honour the same file.
+
 The worker can run on another machine, such as a dev box that is always on.
 Set it up there with its own config, and on your Mac set `TODO_WORKER_HOST`:
-`todo queue`, `unqueue` and `claims` then go over ssh (BatchMode, so the key
-must load without a prompt). Keep `todo work --watch` running there, for
-instance as a systemd user service.
+`todo queue`, `unqueue`, `stop`, `resume` and `claims` (and the queueing in
+`todo do`) then go over ssh (BatchMode, so the key must load without a
+prompt). Keep `todo work --watch` running there, for instance as a systemd
+user service.
+
+### What could the worker do?
+
+`todo go` asks a triage command of your own which items on your list the
+worker could take on. The items are the ones `todo queue` would take: open,
+in a repo of `TODO_QUEUE_OWNERS`, not queued yet, and not with a build bot (no
+label with its prefix, not assigned to it).
+
+`TODO_WORKER_TRIAGE` is that command, run by the shell: on `TODO_WORKER_HOST`
+over ssh when it is set, so it can use the worker's account, and on this
+machine otherwise. It reads a JSON array of refs on stdin, such as
+`["acme/web#88","acme/api#9"]`, and prints one JSON object:
+
+```json
+{"items": [
+  {"ref": "acme/web#88", "verdict": "doable", "reason": "a one-file fix", "size": "S"},
+  {"ref": "acme/api#9", "verdict": "person", "reason": "needs a pricing decision", "size": "M"}
+]}
+```
+
+`verdict` is `doable`, `person` (it needs someone) or `blocked`. `size` is `S`,
+`M` or `L`, and both `reason` and `size` may be left out. The CLI keeps only
+the refs it sent, the first verdict for each, and known verdicts. Items the
+command leaves out show as not judged.
+
+```bash
+todo go                       # the items by verdict, with size and reason
+todo go --yes                 # ...and queue the doable ones
+todo go --json                # the cleaned-up answer, for scripts
+```
 
 ### A build bot
 
@@ -240,6 +290,7 @@ TODO_WORKER_EFFORT=""                      # --effort
 TODO_WORKER_MAX_USE="0.8"                  # wait for the reset from this share of a limit
 TODO_WORKER_TIMEOUT="7200"                 # stop an item after this many seconds
 TODO_WORKER_RULES=""                       # your own rules, after its built-in ones
+TODO_WORKER_TRIAGE=""                      # todo go's triage command (see "What could the worker do?")
 
 # What `todo queue` takes, and build bots (see "A build bot").
 TODO_QUEUE_OWNERS="acme"                   # only these owners' repos; empty: any
