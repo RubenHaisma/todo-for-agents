@@ -415,7 +415,13 @@ list_json() {
   # Search can't OR assignee and author, so those are two queries.
   local excludes=("-repo:$TODO_REPO")
   local r
-  for r in $TODO_HIDE; do excludes+=("-repo:$r"); done
+  # TODO_HIDE holds repos and search qualifiers (label:parked, assignee:some-bot).
+  for r in $TODO_HIDE; do
+    case "$r" in
+      *:*) excludes+=("-$r") ;;
+      *) excludes+=("-repo:$r") ;;
+    esac
+  done
   local fields=number,title,url,labels,updatedAt,repository,assignees
 
   gh issue list -R "$TODO_REPO" --state open --limit 200 \

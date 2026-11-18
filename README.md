@@ -276,7 +276,7 @@ The window only reads that index, because scanning folders such as
 
 ```bash
 TODO_REPO="you/todo"                       # where personal items live
-TODO_HIDE="old-org/old-repo"               # repos to leave off the list
+TODO_HIDE="old-org/old-repo label:parked"  # repos, or search qualifiers, to leave off the list
 TODO_ROOTS="$HOME/Developer $HOME/code"    # where your clones live
 TODO_DIR="$HOME"                           # where personal items open
 TODO_AGENT="claude"                        # or codex, for todo start

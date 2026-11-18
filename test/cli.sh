@@ -209,7 +209,7 @@ EOF
 
 cat >"$tmp/config" <<EOF
 TODO_REPO="me/todo"
-TODO_HIDE="old/repo"
+TODO_HIDE="old/repo label:parked assignee:some-bot"
 TODO_ROOTS="$tmp/src"
 TODO_DIR="$home"
 EOF
@@ -335,7 +335,7 @@ t list --json
 ok "list --json shows the claim on its item" json '.[] | select(.ref == "me/todo#5") | .working[0].agent == "claude"'
 ok "an issue found by both searches is listed once" json '[.[] | select(.ref == "acme/web#88")] | length == 1 and .[0].waitingOn == [] and .[0].working[0].agent == "codex"'
 ok "an issue someone else holds waits on them" json '.[] | select(.ref == "acme/api#9") | .waitingOn == ["alex"]'
-ok "searches leave out the to-do repo and hidden repos" logged "-- -repo:me/todo -repo:old/repo"
+ok "searches leave out the to-do repo, hidden repos and hidden qualifiers" logged "-- -repo:me/todo -repo:old/repo -label:parked -assignee:some-bot"
 t list
 ok "list marks claimed items" line '^me/todo#5 +Personal item  \[▶ claude\]$'
 ok "list keeps only status labels of team issues" line '^acme/web#88 +Team issue  \[▶ codex, status: doing\]$'
